@@ -1314,7 +1314,7 @@ def main():
         # File size info - be realistic about cloud limits
         st.info("""
 **📄 File Size Limits:**
-- **PDFs:** Up to 15 MB
+- **PDFs:** Up to 20 MB
 - **Text/Word files:** Up to 25 MB
 - **For larger files:** Split the PDF or run locally
         """)
@@ -1338,7 +1338,7 @@ def main():
         uploaded_file = st.file_uploader(
             "Choose a file",
             type=["pdf", "docx", "txt", "md"],
-            help="Supported formats: PDF, Word (.docx), Text (.txt), Markdown (.md). Max 15 MB for PDFs."
+            help="Supported formats: PDF, Word (.docx), Text (.txt), Markdown (.md). Max 20 MB for PDFs."
         )
         
         if uploaded_file:
@@ -1347,7 +1347,7 @@ def main():
             is_pdf = uploaded_file.name.lower().endswith('.pdf')
             
             # Different limits for different file types
-            max_size = 15 if is_pdf else 25  # PDFs need more memory to process
+            max_size = 20 if is_pdf else 25  # PDFs need more memory to process
             
             if file_size_mb > max_size:
                 st.error(f"❌ File too large: {file_size_mb:.1f} MB. Maximum for {'PDFs' if is_pdf else 'this file type'}: {max_size} MB")
