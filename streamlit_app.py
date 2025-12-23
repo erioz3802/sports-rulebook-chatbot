@@ -9,6 +9,7 @@ import os
 import re
 import json
 import hashlib
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -300,18 +301,76 @@ def generate_title_from_question(question: str) -> str:
     return title
 
 # Document processing functions
-def extract_text_from_pdf(file_path: str) -> str:
-    """Extract text from PDF file."""
+def extract_text_from_pdf(file_path: str, max_pages_per_batch: int = 20) -> str:
+    """Extract text from PDF file with memory-efficient batch processing."""
     if not PDF_SUPPORT:
         raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
     
-    text = ""
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
+    text_parts = []
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            total_pages = len(pdf.pages)
+            
+            # Process in batches to manage memory
+            for i in range(0, total_pages, max_pages_per_batch):
+                batch_end = min(i + max_pages_per_batch, total_pages)
+                
+                for page_num in range(i, batch_end):
+                    try:
+                        page = pdf.pages[page_num]
+                        page_text = page.extract_text()
+                        if page_text:
+                            text_parts.append(page_text)
+                    except Exception as e:
+                        # Skip problematic pages
+                        text_parts.append(f"[Page {page_num + 1} could not be extracted]")
+                
+                # Force garbage collection after each batch
+                gc.collect()
+                
+    except Exception as e:
+        raise ValueError(f"Could not read PDF: {str(e)}")
+    
+    return "\n".join(text_parts)
+
+
+def split_pdf_into_parts(file_path: str, max_size_mb: int = 5) -> List[str]:
+    """Split a large PDF into smaller parts based on page count."""
+    if not PDF_SUPPORT:
+        raise ImportError("pdfplumber not installed")
+    
+    parts = []
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            total_pages = len(pdf.pages)
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            
+            # Estimate pages per part based on file size
+            pages_per_part = max(5, int(total_pages / (file_size_mb / max_size_mb)))
+            
+            current_part = []
+            part_num = 1
+            
+            for i, page in enumerate(pdf.pages):
+                try:
+                    page_text = page.extract_text()
+                    if page_text:
+                        current_part.append(page_text)
+                except:
+                    current_part.append(f"[Page {i + 1} could not be extracted]")
+                
+                # When we hit the page limit or end of document, save the part
+                if len(current_part) >= pages_per_part or i == total_pages - 1:
+                    if current_part:
+                        parts.append("\n".join(current_part))
+                        current_part = []
+                        part_num += 1
+                        gc.collect()
+            
+    except Exception as e:
+        raise ValueError(f"Could not split PDF: {str(e)}")
+    
+    return parts
 
 def extract_text_from_docx(file_path: str) -> str:
     """Extract text from Word document."""
@@ -401,6 +460,10 @@ def process_document(file_path: str, filename: str, category: str, level: str) -
     # Chunk the text
     chunks = chunk_text(text)
     
+    # Free up memory from text
+    del text
+    gc.collect()
+    
     # Store in database
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -423,12 +486,80 @@ def process_document(file_path: str, filename: str, category: str, level: str) -
                   json.dumps(chunk["rule_references"])))
         
         conn.commit()
+        
+        # Clean up
+        del chunks
+        gc.collect()
+        
         return doc_id
     except Exception as e:
         conn.rollback()
         raise e
     finally:
         conn.close()
+
+
+def process_large_pdf(file_path: str, filename: str, category: str, level: str, progress_callback=None) -> List[str]:
+    """Process a large PDF by splitting it into parts and storing each as a separate document."""
+    parts = split_pdf_into_parts(file_path, max_size_mb=5)
+    doc_ids = []
+    
+    total_parts = len(parts)
+    
+    for i, part_text in enumerate(parts):
+        if not part_text.strip():
+            continue
+        
+        # Generate unique document ID for this part
+        part_filename = f"{filename} (Part {i + 1} of {total_parts})"
+        doc_id = hashlib.md5(f"{part_filename}_{datetime.now().isoformat()}".encode()).hexdigest()[:12]
+        
+        # Chunk the text
+        chunks = chunk_text(part_text)
+        
+        # Free memory
+        del part_text
+        gc.collect()
+        
+        # Store in database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Insert document
+            cursor.execute("""
+                INSERT INTO documents (id, filename, category, level, upload_date, file_size, chunk_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (doc_id, part_filename, category, level, datetime.now().isoformat(), 
+                  os.path.getsize(file_path) // total_parts, len(chunks)))
+            
+            # Insert chunks
+            for chunk in chunks:
+                chunk_id = hashlib.md5(f"{doc_id}_{chunk['chunk_index']}".encode()).hexdigest()[:12]
+                cursor.execute("""
+                    INSERT INTO chunks (id, document_id, content, chunk_index, rule_references)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (chunk_id, doc_id, chunk["content"], chunk["chunk_index"], 
+                      json.dumps(chunk["rule_references"])))
+            
+            conn.commit()
+            doc_ids.append(doc_id)
+            
+            # Clean up
+            del chunks
+            gc.collect()
+            
+            # Update progress
+            if progress_callback:
+                progress_callback(i + 1, total_parts)
+                
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+    
+    return doc_ids
 
 # Search functions (TF-IDF based)
 def tokenize(text: str) -> List[str]:
@@ -1095,6 +1226,9 @@ def main():
     elif page == "📤 Upload":
         st.subheader("📤 Upload Rulebook")
         
+        # File size info
+        st.info("📄 **Small files (< 10 MB):** Processed normally\n\n📚 **Large files (10-50 MB):** Automatically split into parts for processing")
+        
         col1, col2 = st.columns(2)
         
         with col1:
@@ -1114,30 +1248,91 @@ def main():
         uploaded_file = st.file_uploader(
             "Choose a file",
             type=["pdf", "docx", "txt", "md"],
-            help="Supported formats: PDF, Word (.docx), Text (.txt), Markdown (.md)"
+            help="Supported formats: PDF, Word (.docx), Text (.txt), Markdown (.md). Large PDFs will be automatically split."
         )
         
         if uploaded_file:
-            if st.button("📥 Process Document", type="primary"):
-                with st.spinner("Processing document..."):
+            # Check file size
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            
+            if file_size_mb > 50:
+                st.error(f"❌ File too large: {file_size_mb:.1f} MB. Maximum allowed: 50 MB")
+                st.warning("**Tips for very large files:**\n- Split the PDF manually first\n- Convert to text format (.txt)\n- Remove images/graphics from PDF")
+            else:
+                st.caption(f"📄 File size: {file_size_mb:.1f} MB")
+                
+                is_large_file = file_size_mb > 10 and uploaded_file.name.lower().endswith('.pdf')
+                
+                if is_large_file:
+                    st.warning(f"⚠️ Large PDF detected ({file_size_mb:.1f} MB). This will be automatically split into smaller parts for processing.")
+                
+                if st.button("📥 Process Document", type="primary"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
                     try:
+                        status_text.text("Saving file...")
+                        progress_bar.progress(10)
+                        
                         # Save file temporarily
                         file_path = os.path.join(DOCUMENTS_DIR, uploaded_file.name)
                         with open(file_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
                         
-                        # Process document
-                        doc_id = process_document(
-                            file_path,
-                            uploaded_file.name,
-                            upload_category,
-                            upload_level
-                        )
+                        if is_large_file:
+                            # Process large PDF in parts
+                            status_text.text("Splitting large PDF into parts...")
+                            progress_bar.progress(20)
+                            
+                            def update_progress(current, total):
+                                pct = 20 + int((current / total) * 70)
+                                status_text.text(f"Processing part {current} of {total}...")
+                                progress_bar.progress(pct)
+                            
+                            doc_ids = process_large_pdf(
+                                file_path,
+                                uploaded_file.name,
+                                upload_category,
+                                upload_level,
+                                progress_callback=update_progress
+                            )
+                            
+                            progress_bar.progress(100)
+                            status_text.text("Complete!")
+                            
+                            st.success(f"✅ Large PDF processed successfully! Created {len(doc_ids)} document parts.")
+                            st.balloons()
+                        else:
+                            # Process normal file
+                            status_text.text("Extracting text...")
+                            progress_bar.progress(40)
+                            
+                            doc_id = process_document(
+                                file_path,
+                                uploaded_file.name,
+                                upload_category,
+                                upload_level
+                            )
+                            
+                            progress_bar.progress(100)
+                            status_text.text("Complete!")
+                            
+                            st.success(f"✅ Document processed successfully! ID: {doc_id}")
+                            st.balloons()
                         
-                        st.success(f"✅ Document processed successfully! ID: {doc_id}")
-                        st.balloons()
+                        # Clean up
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                        gc.collect()  # Free memory
+                            
                     except Exception as e:
+                        progress_bar.empty()
+                        status_text.empty()
                         st.error(f"❌ Error processing document: {str(e)}")
+                        st.warning("**If this keeps happening:**\n- Try a smaller file\n- Convert PDF to text first\n- Check if the file is corrupted")
+                        gc.collect()  # Free memory even on error
     
     # Documents Page
     elif page == "📚 Documents":
