@@ -1012,7 +1012,7 @@ def main():
         st.metric("📄 Total Chunks", sum(d["chunk_count"] for d in docs))
     
     # Navigation
-    page = st.radio("", ["💬 Chat", "📤 Upload", "📚 Documents"], horizontal=True)
+    page = st.radio("Navigation", ["💬 Chat", "📤 Upload", "📚 Documents"], horizontal=True, label_visibility="collapsed")
     
     st.divider()
     
