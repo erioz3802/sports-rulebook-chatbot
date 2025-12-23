@@ -36,18 +36,29 @@ def save_config(config: Dict):
     except:
         pass  # May fail on cloud deployment, that's OK
 
-def get_api_key() -> Optional[str]:
-    """Get API key from Streamlit secrets (cloud) or config file (local)."""
+def get_api_key() -> tuple:
+    """Get API key from Streamlit secrets (cloud) or config file (local).
+    Returns tuple of (key, source) where source is 'secrets', 'config', or None.
+    """
     # First try Streamlit secrets (for cloud deployment)
     try:
         if hasattr(st, 'secrets') and 'ANTHROPIC_API_KEY' in st.secrets:
-            return st.secrets['ANTHROPIC_API_KEY']
-    except:
+            key = st.secrets['ANTHROPIC_API_KEY']
+            if key and len(key) > 0:
+                return (key, 'secrets')
+    except Exception as e:
         pass
     
     # Fall back to config file (for local use)
-    config = load_config()
-    return config.get("api_key")
+    try:
+        config = load_config()
+        key = config.get("api_key")
+        if key and len(key) > 0:
+            return (key, 'config')
+    except:
+        pass
+    
+    return (None, None)
 
 def save_api_key(api_key: str):
     """Save API key to config."""
@@ -61,6 +72,13 @@ try:
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
+
+# Try PyMuPDF as alternative (more memory efficient)
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_SUPPORT = True
+except ImportError:
+    PYMUPDF_SUPPORT = False
 
 try:
     from docx import Document as DocxDocument
@@ -301,32 +319,59 @@ def generate_title_from_question(question: str) -> str:
     return title
 
 # Document processing functions
-def extract_text_from_pdf(file_path: str, max_pages_per_batch: int = 20) -> str:
-    """Extract text from PDF file with memory-efficient batch processing."""
+def extract_text_from_pdf(file_path: str, max_pages_per_batch: int = 10) -> str:
+    """Extract text from PDF file with memory-efficient processing."""
+    
+    # Try PyMuPDF first (more memory efficient)
+    if PYMUPDF_SUPPORT:
+        try:
+            text_parts = []
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            
+            for i in range(total_pages):
+                try:
+                    page = doc[i]
+                    page_text = page.get_text()
+                    if page_text:
+                        text_parts.append(page_text)
+                except Exception:
+                    text_parts.append(f"[Page {i + 1} could not be extracted]")
+                
+                # Clean up every batch
+                if (i + 1) % max_pages_per_batch == 0:
+                    gc.collect()
+            
+            doc.close()
+            del doc
+            gc.collect()
+            
+            return "\n".join(text_parts)
+        except Exception as e:
+            # Fall back to pdfplumber if PyMuPDF fails
+            pass
+    
+    # Fall back to pdfplumber
     if not PDF_SUPPORT:
-        raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
+        raise ImportError("No PDF library installed. Run: pip install pymupdf or pip install pdfplumber")
     
     text_parts = []
     try:
         with pdfplumber.open(file_path) as pdf:
             total_pages = len(pdf.pages)
             
-            # Process in batches to manage memory
-            for i in range(0, total_pages, max_pages_per_batch):
-                batch_end = min(i + max_pages_per_batch, total_pages)
+            for i in range(total_pages):
+                try:
+                    page = pdf.pages[i]
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_parts.append(page_text)
+                except Exception:
+                    text_parts.append(f"[Page {i + 1} could not be extracted]")
                 
-                for page_num in range(i, batch_end):
-                    try:
-                        page = pdf.pages[page_num]
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_parts.append(page_text)
-                    except Exception as e:
-                        # Skip problematic pages
-                        text_parts.append(f"[Page {page_num + 1} could not be extracted]")
-                
-                # Force garbage collection after each batch
-                gc.collect()
+                # Force garbage collection periodically
+                if (i + 1) % max_pages_per_batch == 0:
+                    gc.collect()
                 
     except Exception as e:
         raise ValueError(f"Could not read PDF: {str(e)}")
@@ -334,38 +379,69 @@ def extract_text_from_pdf(file_path: str, max_pages_per_batch: int = 20) -> str:
     return "\n".join(text_parts)
 
 
-def split_pdf_into_parts(file_path: str, max_size_mb: int = 5) -> List[str]:
-    """Split a large PDF into smaller parts based on page count."""
-    if not PDF_SUPPORT:
-        raise ImportError("pdfplumber not installed")
+def split_pdf_into_parts(file_path: str, pages_per_part: int = 30) -> List[str]:
+    """Split a large PDF into smaller text parts."""
     
     parts = []
+    current_part = []
+    
+    # Try PyMuPDF first (more memory efficient)
+    if PYMUPDF_SUPPORT:
+        try:
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            
+            for i in range(total_pages):
+                try:
+                    page = doc[i]
+                    page_text = page.get_text()
+                    if page_text:
+                        current_part.append(page_text)
+                except Exception:
+                    current_part.append(f"[Page {i + 1} could not be extracted]")
+                
+                # Save part when we hit the limit
+                if len(current_part) >= pages_per_part:
+                    parts.append("\n".join(current_part))
+                    current_part = []
+                    gc.collect()
+            
+            # Don't forget the last part
+            if current_part:
+                parts.append("\n".join(current_part))
+            
+            doc.close()
+            del doc
+            gc.collect()
+            
+            return parts
+        except Exception as e:
+            raise ValueError(f"Could not split PDF: {str(e)}")
+    
+    # Fall back to pdfplumber
+    if not PDF_SUPPORT:
+        raise ImportError("No PDF library installed")
+    
     try:
         with pdfplumber.open(file_path) as pdf:
             total_pages = len(pdf.pages)
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             
-            # Estimate pages per part based on file size
-            pages_per_part = max(5, int(total_pages / (file_size_mb / max_size_mb)))
-            
-            current_part = []
-            part_num = 1
-            
-            for i, page in enumerate(pdf.pages):
+            for i in range(total_pages):
                 try:
+                    page = pdf.pages[i]
                     page_text = page.extract_text()
                     if page_text:
                         current_part.append(page_text)
-                except:
+                except Exception:
                     current_part.append(f"[Page {i + 1} could not be extracted]")
                 
-                # When we hit the page limit or end of document, save the part
-                if len(current_part) >= pages_per_part or i == total_pages - 1:
-                    if current_part:
-                        parts.append("\n".join(current_part))
-                        current_part = []
-                        part_num += 1
-                        gc.collect()
+                if len(current_part) >= pages_per_part:
+                    parts.append("\n".join(current_part))
+                    current_part = []
+                    gc.collect()
+            
+            if current_part:
+                parts.append("\n".join(current_part))
             
     except Exception as e:
         raise ValueError(f"Could not split PDF: {str(e)}")
@@ -1054,7 +1130,9 @@ def main():
         st.subheader("⚙️ Settings")
         
         # API Key - load saved key
-        saved_key = get_api_key() or ""
+        saved_key, key_source = get_api_key()
+        saved_key = saved_key or ""
+        
         api_key = st.text_input(
             "Anthropic API Key", 
             value=saved_key,
@@ -1062,23 +1140,30 @@ def main():
             help="For AI-powered answers. Works without it too!"
         )
         
-        # Save button for API key
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💾 Save Key"):
-                if api_key:
-                    save_api_key(api_key)
-                    st.success("✅ Saved!")
-                else:
-                    st.warning("Enter a key first")
-        with col2:
-            if st.button("🗑️ Clear Key"):
-                save_api_key("")
-                st.success("Cleared!")
-                st.rerun()
+        # Show where API key is loaded from
+        if key_source == 'secrets':
+            st.caption("✅ API key loaded from Streamlit Secrets")
+        elif key_source == 'config':
+            st.caption("✅ API key loaded from local config")
         
-        if saved_key:
-            st.caption("✅ API key saved")
+        # Save button for API key (only show if not using secrets)
+        if key_source != 'secrets':
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 Save Key"):
+                    if api_key:
+                        save_api_key(api_key)
+                        st.success("✅ Saved!")
+                        st.rerun()
+                    else:
+                        st.warning("Enter a key first")
+            with col2:
+                if st.button("🗑️ Clear Key"):
+                    save_api_key("")
+                    st.success("Cleared!")
+                    st.rerun()
+        else:
+            st.caption("(Managed via Streamlit Secrets)")
         
         st.divider()
         
@@ -1226,8 +1311,13 @@ def main():
     elif page == "📤 Upload":
         st.subheader("📤 Upload Rulebook")
         
-        # File size info
-        st.info("📄 **Small files (< 10 MB):** Processed normally\n\n📚 **Large files (10-50 MB):** Automatically split into parts for processing")
+        # File size info - be realistic about cloud limits
+        st.warning("""
+**⚠️ Cloud Hosting Limits:**
+- **Max file size: 8 MB** for PDFs on Streamlit Cloud
+- **For larger files:** Run the app locally on your computer (no limits!)
+- **Tip:** Convert large PDFs to text files (.txt) - they're much smaller
+        """)
         
         col1, col2 = st.columns(2)
         
@@ -1248,23 +1338,30 @@ def main():
         uploaded_file = st.file_uploader(
             "Choose a file",
             type=["pdf", "docx", "txt", "md"],
-            help="Supported formats: PDF, Word (.docx), Text (.txt), Markdown (.md). Large PDFs will be automatically split."
+            help="Supported formats: PDF, Word (.docx), Text (.txt), Markdown (.md). Max 8 MB for PDFs."
         )
         
         if uploaded_file:
             # Check file size
             file_size_mb = uploaded_file.size / (1024 * 1024)
+            is_pdf = uploaded_file.name.lower().endswith('.pdf')
             
-            if file_size_mb > 50:
-                st.error(f"❌ File too large: {file_size_mb:.1f} MB. Maximum allowed: 50 MB")
-                st.warning("**Tips for very large files:**\n- Split the PDF manually first\n- Convert to text format (.txt)\n- Remove images/graphics from PDF")
+            # Different limits for different file types
+            max_size = 8 if is_pdf else 20  # PDFs need more memory to process
+            
+            if file_size_mb > max_size:
+                st.error(f"❌ File too large: {file_size_mb:.1f} MB. Maximum for {'PDFs' if is_pdf else 'this file type'}: {max_size} MB")
+                st.markdown("""
+**Options for large files:**
+1. **Run locally** - Download the app and run on your PC (no limits):
+   ```
+   python -m streamlit run streamlit_app.py
+   ```
+2. **Convert to text** - Copy/paste rulebook text into a .txt file
+3. **Split the PDF** - Use [ilovepdf.com/split_pdf](https://www.ilovepdf.com/split_pdf) to split into smaller parts
+                """)
             else:
-                st.caption(f"📄 File size: {file_size_mb:.1f} MB")
-                
-                is_large_file = file_size_mb > 10 and uploaded_file.name.lower().endswith('.pdf')
-                
-                if is_large_file:
-                    st.warning(f"⚠️ Large PDF detected ({file_size_mb:.1f} MB). This will be automatically split into smaller parts for processing.")
+                st.caption(f"📄 File size: {file_size_mb:.1f} MB ✅")
                 
                 if st.button("📥 Process Document", type="primary"):
                     progress_bar = st.progress(0)
@@ -1279,46 +1376,22 @@ def main():
                         with open(file_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
                         
-                        if is_large_file:
-                            # Process large PDF in parts
-                            status_text.text("Splitting large PDF into parts...")
-                            progress_bar.progress(20)
-                            
-                            def update_progress(current, total):
-                                pct = 20 + int((current / total) * 70)
-                                status_text.text(f"Processing part {current} of {total}...")
-                                progress_bar.progress(pct)
-                            
-                            doc_ids = process_large_pdf(
-                                file_path,
-                                uploaded_file.name,
-                                upload_category,
-                                upload_level,
-                                progress_callback=update_progress
-                            )
-                            
-                            progress_bar.progress(100)
-                            status_text.text("Complete!")
-                            
-                            st.success(f"✅ Large PDF processed successfully! Created {len(doc_ids)} document parts.")
-                            st.balloons()
-                        else:
-                            # Process normal file
-                            status_text.text("Extracting text...")
-                            progress_bar.progress(40)
-                            
-                            doc_id = process_document(
-                                file_path,
-                                uploaded_file.name,
-                                upload_category,
-                                upload_level
-                            )
-                            
-                            progress_bar.progress(100)
-                            status_text.text("Complete!")
-                            
-                            st.success(f"✅ Document processed successfully! ID: {doc_id}")
-                            st.balloons()
+                        # Process file
+                        status_text.text("Extracting text...")
+                        progress_bar.progress(40)
+                        
+                        doc_id = process_document(
+                            file_path,
+                            uploaded_file.name,
+                            upload_category,
+                            upload_level
+                        )
+                        
+                        progress_bar.progress(100)
+                        status_text.text("Complete!")
+                        
+                        st.success(f"✅ Document processed successfully! ID: {doc_id}")
+                        st.balloons()
                         
                         # Clean up
                         try:
@@ -1331,7 +1404,7 @@ def main():
                         progress_bar.empty()
                         status_text.empty()
                         st.error(f"❌ Error processing document: {str(e)}")
-                        st.warning("**If this keeps happening:**\n- Try a smaller file\n- Convert PDF to text first\n- Check if the file is corrupted")
+                        st.warning("**If this keeps happening:**\n- Try a smaller file\n- Convert PDF to text first\n- Run locally for large files")
                         gc.collect()  # Free memory even on error
     
     # Documents Page
