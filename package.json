@@ -1,5 +1,5 @@
 {
-  "name": "baseball-rules-assistant",
+  "name": "baseball-rules-assistant-gdrive",
   "version": "1.0.0",
   "description": "RAG-based Baseball Rules Assistant with PDF upload and category management",
   "type": "module",
