@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 
 // Set up PDF.js worker for v5+
@@ -7,35 +7,199 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url
 ).toString();
 
-// ============ IndexedDB Helper ============
-const DB_NAME = 'BaseballRulesRAG';
-const DB_VERSION = 1;
+// ============ Google Drive API Helper ============
+const SCOPES = 'https://www.googleapis.com/auth/drive.file';
+const APP_FOLDER_NAME = 'BaseballRulesAssistant';
+const CONFIG_FILE_NAME = 'config.json';
+const CHUNKS_FILE_NAME = 'chunks.json';
 
-const openDB = () => {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-    request.onupgradeneeded = (event) => {
-      const db = event.target.result;
-      if (!db.objectStoreNames.contains('categories')) {
-        db.createObjectStore('categories', { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains('documents')) {
-        const docStore = db.createObjectStore('documents', { keyPath: 'id' });
-        docStore.createIndex('categoryId', 'categoryId', { unique: false });
-      }
-      if (!db.objectStoreNames.contains('chunks')) {
-        const chunkStore = db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
-        chunkStore.createIndex('documentId', 'documentId', { unique: false });
-        chunkStore.createIndex('categoryId', 'categoryId', { unique: false });
-      }
-      if (!db.objectStoreNames.contains('settings')) {
-        db.createObjectStore('settings', { keyPath: 'key' });
-      }
+class GoogleDriveService {
+  constructor() {
+    this.tokenClient = null;
+    this.accessToken = null;
+    this.appFolderId = null;
+  }
+
+  async init(clientId, onAuthChange) {
+    return new Promise((resolve) => {
+      // Load Google Identity Services
+      const script = document.createElement('script');
+      script.src = 'https://accounts.google.com/gsi/client';
+      script.onload = () => {
+        this.tokenClient = window.google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: SCOPES,
+          callback: async (response) => {
+            if (response.access_token) {
+              this.accessToken = response.access_token;
+              localStorage.setItem('gdriveToken', response.access_token);
+              await this.ensureAppFolder();
+              onAuthChange(true);
+            }
+          },
+        });
+        
+        // Check for existing token
+        const savedToken = localStorage.getItem('gdriveToken');
+        if (savedToken) {
+          this.accessToken = savedToken;
+          this.validateToken().then(valid => {
+            if (valid) {
+              this.ensureAppFolder().then(() => onAuthChange(true));
+            } else {
+              localStorage.removeItem('gdriveToken');
+              onAuthChange(false);
+            }
+          });
+        }
+        resolve();
+      };
+      document.body.appendChild(script);
+    });
+  }
+
+  async validateToken() {
+    if (!this.accessToken) return false;
+    try {
+      const response = await fetch('https://www.googleapis.com/drive/v3/about?fields=user', {
+        headers: { Authorization: `Bearer ${this.accessToken}` }
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  signIn() {
+    this.tokenClient.requestAccessToken({ prompt: 'consent' });
+  }
+
+  signOut(onAuthChange) {
+    if (this.accessToken) {
+      window.google.accounts.oauth2.revoke(this.accessToken);
+      this.accessToken = null;
+      this.appFolderId = null;
+      localStorage.removeItem('gdriveToken');
+      onAuthChange(false);
+    }
+  }
+
+  async ensureAppFolder() {
+    // Check if folder exists
+    const searchResponse = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=name='${APP_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      { headers: { Authorization: `Bearer ${this.accessToken}` } }
+    );
+    const searchData = await searchResponse.json();
+    
+    if (searchData.files && searchData.files.length > 0) {
+      this.appFolderId = searchData.files[0].id;
+    } else {
+      // Create folder
+      const createResponse = await fetch('https://www.googleapis.com/drive/v3/files', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          name: APP_FOLDER_NAME,
+          mimeType: 'application/vnd.google-apps.folder'
+        })
+      });
+      const createData = await createResponse.json();
+      this.appFolderId = createData.id;
+    }
+    return this.appFolderId;
+  }
+
+  async findFile(fileName) {
+    const response = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=name='${fileName}' and '${this.appFolderId}' in parents and trashed=false`,
+      { headers: { Authorization: `Bearer ${this.accessToken}` } }
+    );
+    const data = await response.json();
+    return data.files && data.files.length > 0 ? data.files[0] : null;
+  }
+
+  async readJsonFile(fileName) {
+    const file = await this.findFile(fileName);
+    if (!file) return null;
+    
+    const response = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`,
+      { headers: { Authorization: `Bearer ${this.accessToken}` } }
+    );
+    return response.json();
+  }
+
+  async writeJsonFile(fileName, data) {
+    const file = await this.findFile(fileName);
+    const content = JSON.stringify(data);
+    const blob = new Blob([content], { type: 'application/json' });
+    
+    if (file) {
+      // Update existing file
+      await fetch(`https://www.googleapis.com/upload/drive/v3/files/${file.id}?uploadType=media`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+        body: blob
+      });
+    } else {
+      // Create new file
+      const metadata = {
+        name: fileName,
+        parents: [this.appFolderId]
+      };
+      
+      const form = new FormData();
+      form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+      form.append('file', blob);
+      
+      await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+        body: form
+      });
+    }
+  }
+
+  async uploadPdf(file, categoryId) {
+    const metadata = {
+      name: `${categoryId}_${Date.now()}_${file.name}`,
+      parents: [this.appFolderId]
     };
-  });
-};
+    
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+    form.append('file', file);
+    
+    const response = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.accessToken}` },
+      body: form
+    });
+    
+    return response.json();
+  }
+
+  async deletePdfFile(fileId) {
+    await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${this.accessToken}` }
+    });
+  }
+
+  async downloadPdf(fileId) {
+    const response = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      { headers: { Authorization: `Bearer ${this.accessToken}` } }
+    );
+    return response.arrayBuffer();
+  }
+}
+
+const driveService = new GoogleDriveService();
 
 // ============ Text Processing ============
 const chunkText = (text, chunkSize = 1500, overlap = 200) => {
@@ -77,7 +241,6 @@ const searchChunks = (chunks, query, topK = 8) => {
       if (queryKeywords.has(word)) score += 1;
     });
     
-    // Boost for rule references
     const rulePattern = /rule\s*\d+[-.]?\d*/gi;
     const queryRules = query.match(rulePattern) || [];
     const chunkRules = chunk.text.match(rulePattern) || [];
@@ -87,9 +250,7 @@ const searchChunks = (chunks, query, topK = 8) => {
       }
     });
     
-    // Boost for exact phrase matches
-    const queryLower = query.toLowerCase();
-    if (chunk.text.toLowerCase().includes(queryLower)) {
+    if (chunk.text.toLowerCase().includes(query.toLowerCase())) {
       score += 10;
     }
     
@@ -104,6 +265,15 @@ const searchChunks = (chunks, query, topK = 8) => {
 
 // ============ Main Component ============
 export default function App() {
+  // Google Client ID - Users will set this
+  const [clientId, setClientId] = useState(() => localStorage.getItem('googleClientId') || '');
+  const [clientIdInput, setClientIdInput] = useState('');
+  const [showSetup, setShowSetup] = useState(false);
+  
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isInitialized, setIsInitialized] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  
   const [apiKey, setApiKey] = useState('');
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [categories, setCategories] = useState([]);
@@ -112,84 +282,114 @@ export default function App() {
   const [selectedCategory, setSelectedCategory] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   const [activeTab, setActiveTab] = useState('chat');
   const [uploadProgress, setUploadProgress] = useState(null);
   const [newCategoryName, setNewCategoryName] = useState('');
   const [showSettings, setShowSettings] = useState(false);
+  const [saveStatus, setSaveStatus] = useState('');
   const messagesEndRef = useRef(null);
 
-  // Load data from IndexedDB on mount
+  // Initialize Google Drive
   useEffect(() => {
-    loadData();
-  }, []);
+    if (clientId) {
+      driveService.init(clientId, (authenticated) => {
+        setIsAuthenticated(authenticated);
+        setIsInitialized(true);
+        if (authenticated) {
+          loadDataFromDrive();
+        } else {
+          setIsLoading(false);
+        }
+      });
+    } else {
+      setIsLoading(false);
+    }
+  }, [clientId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const loadData = async () => {
+  const loadDataFromDrive = async () => {
+    setIsLoading(true);
     try {
-      const db = await openDB();
+      const config = await driveService.readJsonFile(CONFIG_FILE_NAME);
+      if (config) {
+        setApiKey(config.apiKey || '');
+        setCategories(config.categories || []);
+        setDocuments(config.documents || []);
+      }
       
-      // Load API key
-      const settingsTransaction = db.transaction('settings', 'readonly');
-      const settingsStore = settingsTransaction.objectStore('settings');
-      const apiKeyRequest = settingsStore.get('apiKey');
-      apiKeyRequest.onsuccess = () => {
-        if (apiKeyRequest.result) {
-          setApiKey(apiKeyRequest.result.value);
-        }
-      };
-      
-      // Load categories
-      const catTransaction = db.transaction('categories', 'readonly');
-      const catStore = catTransaction.objectStore('categories');
-      const catRequest = catStore.getAll();
-      catRequest.onsuccess = () => setCategories(catRequest.result || []);
-      
-      // Load documents
-      const docTransaction = db.transaction('documents', 'readonly');
-      const docStore = docTransaction.objectStore('documents');
-      const docRequest = docStore.getAll();
-      docRequest.onsuccess = () => setDocuments(docRequest.result || []);
-      
-      // Load chunks
-      const chunkTransaction = db.transaction('chunks', 'readonly');
-      const chunkStore = chunkTransaction.objectStore('chunks');
-      const chunkRequest = chunkStore.getAll();
-      chunkRequest.onsuccess = () => setChunks(chunkRequest.result || []);
+      const chunksData = await driveService.readJsonFile(CHUNKS_FILE_NAME);
+      if (chunksData) {
+        setChunks(chunksData);
+      }
     } catch (error) {
-      console.error('Error loading data:', error);
+      console.error('Error loading from Drive:', error);
+    }
+    setIsLoading(false);
+  };
+
+  const saveConfigToDrive = useCallback(async (newApiKey, newCategories, newDocuments) => {
+    setSaveStatus('Saving...');
+    try {
+      await driveService.writeJsonFile(CONFIG_FILE_NAME, {
+        apiKey: newApiKey,
+        categories: newCategories,
+        documents: newDocuments
+      });
+      setSaveStatus('Saved ✓');
+      setTimeout(() => setSaveStatus(''), 2000);
+    } catch (error) {
+      console.error('Error saving config:', error);
+      setSaveStatus('Save failed');
+    }
+  }, []);
+
+  const saveChunksToDrive = useCallback(async (newChunks) => {
+    try {
+      await driveService.writeJsonFile(CHUNKS_FILE_NAME, newChunks);
+    } catch (error) {
+      console.error('Error saving chunks:', error);
+    }
+  }, []);
+
+  const handleSignIn = () => {
+    driveService.signIn();
+  };
+
+  const handleSignOut = () => {
+    driveService.signOut(setIsAuthenticated);
+    setApiKey('');
+    setCategories([]);
+    setDocuments([]);
+    setChunks([]);
+    setMessages([]);
+  };
+
+  const saveClientId = () => {
+    if (clientIdInput.trim()) {
+      localStorage.setItem('googleClientId', clientIdInput.trim());
+      setClientId(clientIdInput.trim());
+      setClientIdInput('');
+      setShowSetup(false);
     }
   };
 
   const saveApiKey = async () => {
-    if (!apiKeyInput.trim()) return;
-    
-    try {
-      const db = await openDB();
-      const transaction = db.transaction('settings', 'readwrite');
-      const store = transaction.objectStore('settings');
-      store.put({ key: 'apiKey', value: apiKeyInput.trim() });
-      setApiKey(apiKeyInput.trim());
+    if (apiKeyInput.trim()) {
+      const newApiKey = apiKeyInput.trim();
+      setApiKey(newApiKey);
       setApiKeyInput('');
       setShowSettings(false);
-    } catch (error) {
-      console.error('Error saving API key:', error);
+      await saveConfigToDrive(newApiKey, categories, documents);
     }
   };
 
   const clearApiKey = async () => {
-    try {
-      const db = await openDB();
-      const transaction = db.transaction('settings', 'readwrite');
-      const store = transaction.objectStore('settings');
-      store.delete('apiKey');
-      setApiKey('');
-    } catch (error) {
-      console.error('Error clearing API key:', error);
-    }
+    setApiKey('');
+    await saveConfigToDrive('', categories, documents);
   };
 
   const addCategory = async () => {
@@ -201,118 +401,97 @@ export default function App() {
       createdAt: new Date().toISOString()
     };
     
-    try {
-      const db = await openDB();
-      const transaction = db.transaction('categories', 'readwrite');
-      transaction.objectStore('categories').add(category);
-      setCategories([...categories, category]);
-      setNewCategoryName('');
-    } catch (error) {
-      console.error('Error adding category:', error);
-    }
+    const newCategories = [...categories, category];
+    setCategories(newCategories);
+    setNewCategoryName('');
+    await saveConfigToDrive(apiKey, newCategories, documents);
   };
 
   const deleteCategory = async (categoryId) => {
     if (!confirm('Delete this category and all its documents?')) return;
     
-    try {
-      const db = await openDB();
-      
-      const catTransaction = db.transaction('categories', 'readwrite');
-      catTransaction.objectStore('categories').delete(categoryId);
-      
-      const docsToDelete = documents.filter(d => d.categoryId === categoryId);
-      const docTransaction = db.transaction('documents', 'readwrite');
-      const docStore = docTransaction.objectStore('documents');
-      docsToDelete.forEach(doc => docStore.delete(doc.id));
-      
-      const chunkTransaction = db.transaction('chunks', 'readwrite');
-      const chunkStore = chunkTransaction.objectStore('chunks');
-      chunks.filter(c => c.categoryId === categoryId).forEach(chunk => {
-        if (chunk.id) chunkStore.delete(chunk.id);
-      });
-      
-      setCategories(categories.filter(c => c.id !== categoryId));
-      setDocuments(documents.filter(d => d.categoryId !== categoryId));
-      setChunks(chunks.filter(c => c.categoryId !== categoryId));
-      
-      if (selectedCategory === categoryId) setSelectedCategory(null);
-    } catch (error) {
-      console.error('Error deleting category:', error);
+    // Delete PDF files from Drive
+    const docsToDelete = documents.filter(d => d.categoryId === categoryId);
+    for (const doc of docsToDelete) {
+      if (doc.driveFileId) {
+        await driveService.deletePdfFile(doc.driveFileId);
+      }
     }
+    
+    const newCategories = categories.filter(c => c.id !== categoryId);
+    const newDocuments = documents.filter(d => d.categoryId !== categoryId);
+    const newChunks = chunks.filter(c => c.categoryId !== categoryId);
+    
+    setCategories(newCategories);
+    setDocuments(newDocuments);
+    setChunks(newChunks);
+    
+    if (selectedCategory === categoryId) setSelectedCategory(null);
+    
+    await saveConfigToDrive(apiKey, newCategories, newDocuments);
+    await saveChunksToDrive(newChunks);
   };
 
-  const extractTextFromPDF = async (file) => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        try {
-          const typedArray = new Uint8Array(e.target.result);
-          const pdf = await pdfjsLib.getDocument(typedArray).promise;
-          let fullText = '';
-          
-          for (let i = 1; i <= pdf.numPages; i++) {
-            setUploadProgress(`Extracting page ${i} of ${pdf.numPages}...`);
-            const page = await pdf.getPage(i);
-            const textContent = await page.getTextContent();
-            const pageText = textContent.items.map(item => item.str).join(' ');
-            fullText += `\n[Page ${i}]\n${pageText}\n`;
-          }
-          
-          resolve(fullText);
-        } catch (error) {
-          reject(error);
-        }
-      };
-      reader.onerror = reject;
-      reader.readAsArrayBuffer(file);
-    });
+  const extractTextFromPDF = async (arrayBuffer) => {
+    const typedArray = new Uint8Array(arrayBuffer);
+    const pdf = await pdfjsLib.getDocument(typedArray).promise;
+    let fullText = '';
+    
+    for (let i = 1; i <= pdf.numPages; i++) {
+      setUploadProgress(`Extracting page ${i} of ${pdf.numPages}...`);
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map(item => item.str).join(' ');
+      fullText += `\n[Page ${i}]\n${pageText}\n`;
+    }
+    
+    return { text: fullText, pageCount: pdf.numPages };
   };
 
   const uploadDocument = async (file, categoryId) => {
     if (!file || !categoryId) return;
     
-    setUploadProgress('Starting upload...');
+    setUploadProgress('Uploading to Google Drive...');
     
     try {
-      const text = await extractTextFromPDF(file);
+      // Upload PDF to Drive
+      const driveFile = await driveService.uploadPdf(file, categoryId);
+      
+      // Read file for text extraction
+      const arrayBuffer = await file.arrayBuffer();
+      const { text, pageCount } = await extractTextFromPDF(arrayBuffer);
       
       const document = {
         id: Date.now().toString(),
         categoryId,
         name: file.name,
+        driveFileId: driveFile.id,
         uploadedAt: new Date().toISOString(),
-        pageCount: (text.match(/\[Page \d+\]/g) || []).length
+        pageCount
       };
-      
-      setUploadProgress('Saving document...');
-      const db = await openDB();
-      const docTransaction = db.transaction('documents', 'readwrite');
-      docTransaction.objectStore('documents').add(document);
       
       setUploadProgress('Processing text chunks...');
       const textChunks = chunkText(text, 1500, 200);
       
-      const chunkTransaction = db.transaction('chunks', 'readwrite');
-      const chunkStore = chunkTransaction.objectStore('chunks');
+      const newChunks = textChunks.map((chunkText, i) => ({
+        id: `${document.id}_${i}`,
+        documentId: document.id,
+        categoryId,
+        text: chunkText,
+        index: i
+      }));
       
-      const newChunks = [];
-      for (let i = 0; i < textChunks.length; i++) {
-        setUploadProgress(`Indexing chunk ${i + 1} of ${textChunks.length}...`);
-        const chunk = {
-          documentId: document.id,
-          categoryId,
-          text: textChunks[i],
-          index: i
-        };
-        chunkStore.add(chunk);
-        newChunks.push(chunk);
-      }
+      const updatedDocuments = [...documents, document];
+      const updatedChunks = [...chunks, ...newChunks];
       
-      setDocuments([...documents, document]);
-      setChunks([...chunks, ...newChunks]);
+      setDocuments(updatedDocuments);
+      setChunks(updatedChunks);
+      
+      setUploadProgress('Saving to cloud...');
+      await saveConfigToDrive(apiKey, categories, updatedDocuments);
+      await saveChunksToDrive(updatedChunks);
+      
       setUploadProgress(null);
-      
     } catch (error) {
       console.error('Error uploading document:', error);
       setUploadProgress(`Error: ${error.message}`);
@@ -323,33 +502,29 @@ export default function App() {
   const deleteDocument = async (documentId) => {
     if (!confirm('Delete this document?')) return;
     
-    try {
-      const db = await openDB();
-      
-      const docTransaction = db.transaction('documents', 'readwrite');
-      docTransaction.objectStore('documents').delete(documentId);
-      
-      const chunkTransaction = db.transaction('chunks', 'readwrite');
-      const chunkStore = chunkTransaction.objectStore('chunks');
-      chunks.filter(c => c.documentId === documentId).forEach(chunk => {
-        if (chunk.id) chunkStore.delete(chunk.id);
-      });
-      
-      setDocuments(documents.filter(d => d.id !== documentId));
-      setChunks(chunks.filter(c => c.documentId !== documentId));
-    } catch (error) {
-      console.error('Error deleting document:', error);
+    const doc = documents.find(d => d.id === documentId);
+    if (doc?.driveFileId) {
+      await driveService.deletePdfFile(doc.driveFileId);
     }
+    
+    const newDocuments = documents.filter(d => d.id !== documentId);
+    const newChunks = chunks.filter(c => c.documentId !== documentId);
+    
+    setDocuments(newDocuments);
+    setChunks(newChunks);
+    
+    await saveConfigToDrive(apiKey, categories, newDocuments);
+    await saveChunksToDrive(newChunks);
   };
 
   const sendMessage = async () => {
-    if (!input.trim() || isLoading || !selectedCategory || !apiKey) return;
+    if (!input.trim() || isSending || !selectedCategory || !apiKey) return;
     
     const userMessage = { role: 'user', content: input.trim() };
     const newMessages = [...messages, userMessage];
     setMessages(newMessages);
     setInput('');
-    setIsLoading(true);
+    setIsSending(true);
     
     try {
       const categoryChunks = chunks.filter(c => c.categoryId === selectedCategory);
@@ -359,7 +534,7 @@ export default function App() {
           role: 'assistant',
           content: "I don't have any documents loaded for this category yet. Please upload some PDFs first in the Manage tab."
         }]);
-        setIsLoading(false);
+        setIsSending(false);
         return;
       }
       
@@ -425,7 +600,7 @@ Guidelines:
         content: `Error: ${error.message}. Please check your API key and try again.`
       }]);
     } finally {
-      setIsLoading(false);
+      setIsSending(false);
     }
   };
 
@@ -437,6 +612,106 @@ Guidelines:
   const getCategoryChunkCount = (categoryId) => chunks.filter(c => c.categoryId === categoryId).length;
 
   // ============ RENDER ============
+
+  // Setup screen - no client ID configured
+  if (!clientId) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-green-50 to-white flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-xl p-8 max-w-lg w-full">
+          <div className="text-center mb-6">
+            <span className="text-6xl">⚾</span>
+            <h1 className="text-2xl font-bold mt-4">Baseball Rules Assistant</h1>
+            <p className="text-gray-600 mt-2">First-time setup required</p>
+          </div>
+          
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6">
+            <h3 className="font-semibold text-blue-800 mb-2">Setup Instructions:</h3>
+            <ol className="text-sm text-blue-900 space-y-2 list-decimal list-inside">
+              <li>Go to <a href="https://console.cloud.google.com" target="_blank" rel="noopener noreferrer" className="underline">Google Cloud Console</a></li>
+              <li>Create a new project (or select existing)</li>
+              <li>Enable the <strong>Google Drive API</strong></li>
+              <li>Go to Credentials → Create Credentials → OAuth Client ID</li>
+              <li>Application type: <strong>Web application</strong></li>
+              <li>Add your app URL to Authorized JavaScript origins</li>
+              <li>Copy the Client ID and paste below</li>
+            </ol>
+          </div>
+          
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Google OAuth Client ID
+              </label>
+              <input
+                type="text"
+                value={clientIdInput}
+                onChange={(e) => setClientIdInput(e.target.value)}
+                placeholder="123456789-abc123.apps.googleusercontent.com"
+                className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500"
+              />
+            </div>
+            <button
+              onClick={saveClientId}
+              disabled={!clientIdInput.trim()}
+              className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-300 text-white py-3 rounded-lg font-medium transition-colors"
+            >
+              Save & Continue
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Loading screen
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-green-50 to-white flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin text-6xl mb-4">⚾</div>
+          <p className="text-gray-600">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Sign in screen
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-green-50 to-white flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-xl p-8 max-w-md w-full text-center">
+          <span className="text-6xl">⚾</span>
+          <h1 className="text-2xl font-bold mt-4">Baseball Rules Assistant</h1>
+          <p className="text-gray-600 mt-2 mb-6">Sign in to access your rule books from any device</p>
+          
+          <button
+            onClick={handleSignIn}
+            className="w-full bg-white border-2 border-gray-300 hover:border-gray-400 py-3 rounded-lg font-medium transition-colors flex items-center justify-center gap-3"
+          >
+            <svg className="w-5 h-5" viewBox="0 0 24 24">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+            </svg>
+            Sign in with Google
+          </button>
+          
+          <button
+            onClick={() => {
+              localStorage.removeItem('googleClientId');
+              setClientId('');
+            }}
+            className="mt-4 text-sm text-gray-500 hover:text-gray-700"
+          >
+            Change Google Client ID
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Main app
   return (
     <div className="flex flex-col h-screen bg-gray-100">
       {/* Header */}
@@ -446,14 +721,25 @@ Guidelines:
             <h1 className="text-2xl font-bold flex items-center gap-2">
               ⚾ Baseball Rules Assistant
             </h1>
-            <p className="text-green-200 text-sm mt-1">Upload rule books • Organize by category • Ask questions</p>
+            <p className="text-green-200 text-sm mt-1">
+              Synced to Google Drive
+              {saveStatus && <span className="ml-2">• {saveStatus}</span>}
+            </p>
           </div>
-          <button
-            onClick={() => setShowSettings(!showSettings)}
-            className="bg-green-600 hover:bg-green-500 px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
-          >
-            ⚙️ Settings
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className="bg-green-600 hover:bg-green-500 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+            >
+              ⚙️ Settings
+            </button>
+            <button
+              onClick={handleSignOut}
+              className="bg-green-800 hover:bg-green-700 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+            >
+              Sign Out
+            </button>
+          </div>
         </div>
       </div>
 
@@ -498,7 +784,7 @@ Guidelines:
                 </div>
               )}
               <p className="text-xs text-gray-500 mt-2">
-                Your API key is stored locally in your browser and never sent anywhere except Anthropic's API.
+                Stored in your Google Drive - synced across all devices.
               </p>
             </div>
             
@@ -741,13 +1027,13 @@ Guidelines:
                   ))
                 )}
                 
-                {isLoading && (
+                {isSending && (
                   <div className="flex justify-start">
                     <div className="bg-white shadow-md border border-gray-200 rounded-2xl rounded-bl-md px-5 py-3">
                       <div className="flex items-center gap-1 text-gray-500">
-                        <span className="animate-pulse-dot">●</span>
-                        <span className="animate-pulse-dot">●</span>
-                        <span className="animate-pulse-dot">●</span>
+                        <span className="animate-pulse">●</span>
+                        <span className="animate-pulse">●</span>
+                        <span className="animate-pulse">●</span>
                         <span className="ml-2">Searching rule books...</span>
                       </div>
                     </div>
@@ -772,12 +1058,12 @@ Guidelines:
                         ? "Select a category first..." 
                         : "Ask a rules question..."
                   }
-                  disabled={!selectedCategory || isLoading || !apiKey}
+                  disabled={!selectedCategory || isSending || !apiKey}
                   className="flex-1 border border-gray-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-100"
                 />
                 <button
                   onClick={sendMessage}
-                  disabled={!selectedCategory || isLoading || !input.trim() || !apiKey}
+                  disabled={!selectedCategory || isSending || !input.trim() || !apiKey}
                   className="bg-green-600 hover:bg-green-700 disabled:bg-gray-300 text-white px-6 py-3 rounded-xl font-medium transition-colors"
                 >
                   Send
