@@ -284,6 +284,7 @@ export default function App() {
   
   const [apiKey, setApiKey] = useState('');
   const [apiKeyInput, setApiKeyInput] = useState('');
+  const [selectedModel, setSelectedModel] = useState(() => localStorage.getItem('selectedModel') || 'claude-sonnet-4-6');
   const [categories, setCategories] = useState([]);
   const [documents, setDocuments] = useState([]);
   const [chunks, setChunks] = useState([]);
@@ -570,42 +571,72 @@ Guidelines:
 6. Format responses clearly with headers and bullets for complex answers
 7. Explain the reasoning/purpose behind rules when helpful`;
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true'
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2000,
-          system: systemPrompt,
-          messages: newMessages.slice(-10).map(m => ({ role: m.role, content: m.content }))
-        })
-      });
+      const maxRetries = 3;
+      let lastError = null;
 
-      const data = await response.json();
-      
-      if (data.content?.[0]?.text) {
-        const sourceDocs = [...new Set(relevantChunks.map(c => {
-          const doc = documents.find(d => d.id === c.documentId);
-          return doc?.name;
-        }).filter(Boolean))];
-        
-        setMessages([...newMessages, { 
-          role: 'assistant', 
-          content: data.content[0].text,
-          sources: sourceDocs
-        }]);
-      } else if (data.error) {
-        throw new Error(data.error.message);
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        if (attempt > 0) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+          await new Promise(r => setTimeout(r, delay));
+        }
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true'
+          },
+          body: JSON.stringify({
+            model: selectedModel,
+            max_tokens: 2000,
+            system: systemPrompt,
+            messages: newMessages.slice(-10).map(m => ({ role: m.role, content: m.content }))
+          })
+        });
+
+        const data = await response.json();
+
+        if (data.content?.[0]?.text) {
+          const sourceDocs = [...new Set(relevantChunks.map(c => {
+            const doc = documents.find(d => d.id === c.documentId);
+            return doc?.name;
+          }).filter(Boolean))];
+
+          setMessages([...newMessages, {
+            role: 'assistant',
+            content: data.content[0].text,
+            sources: sourceDocs
+          }]);
+          return;
+        } else if (data.error) {
+          lastError = data.error;
+          // Retry on overload (529) or rate limit (429) errors
+          if (response.status === 529 || response.status === 429) {
+            continue;
+          }
+          throw new Error(data.error.message);
+        }
       }
+
+      // All retries exhausted
+      throw new Error(lastError?.message || 'The API is currently overloaded. Please try again in a moment.');
     } catch (error) {
-      setMessages([...newMessages, { 
-        role: 'assistant', 
-        content: `Error: ${error.message}. Please check your API key and try again.`
+      const msg = error.message?.toLowerCase() || '';
+      let userMessage;
+      if (msg.includes('overloaded')) {
+        userMessage = 'The AI service is temporarily overloaded. Please wait a moment and try again.';
+      } else if (msg.includes('invalid') || msg.includes('authentication') || msg.includes('unauthorized')) {
+        userMessage = 'API key error. Please check your API key in Settings.';
+      } else if (msg.includes('rate')) {
+        userMessage = 'Rate limit reached. Please wait a moment and try again.';
+      } else {
+        userMessage = `Error: ${error.message}`;
+      }
+      setMessages([...newMessages, {
+        role: 'assistant',
+        content: userMessage
       }]);
     } finally {
       setIsSending(false);
@@ -795,7 +826,28 @@ Guidelines:
                 Stored in your Google Drive - synced across all devices.
               </p>
             </div>
-            
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                AI Model
+              </label>
+              <select
+                value={selectedModel}
+                onChange={(e) => {
+                  setSelectedModel(e.target.value);
+                  localStorage.setItem('selectedModel', e.target.value);
+                }}
+                className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500 bg-white"
+              >
+                <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (Recommended)</option>
+                <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (Faster, cheaper)</option>
+                <option value="claude-sonnet-4-20250514">Claude Sonnet 4 (Legacy)</option>
+              </select>
+              <p className="text-xs text-gray-500 mt-2">
+                If you're getting overload errors, try switching models.
+              </p>
+            </div>
+
             <div className="flex justify-end">
               <button
                 onClick={() => setShowSettings(false)}
