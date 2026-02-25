@@ -16,6 +16,14 @@ const APP_FOLDER_NAME = 'BaseballRulesAssistant';
 const CONFIG_FILE_NAME = 'config.json';
 const CHUNKS_FILE_NAME = 'chunks.json';
 const CHAT_HISTORY_FILE_NAME = 'chat-history.json';
+const PINNED_ANSWERS_FILE_NAME = 'pinned-answers.json';
+
+const STARTER_QUESTIONS = [
+  "What is the infield fly rule?",
+  "When can a runner steal a base?",
+  "What's the difference between a balk and an illegal pitch?",
+  "How does the designated hitter rule work?"
+];
 
 class GoogleDriveService {
   constructor() {
@@ -251,6 +259,14 @@ export default function App() {
   const previousCategoryRef = useRef(null);
   const messagesEndRef = useRef(null);
   const bm25IndexRef = useRef(new BM25Index());
+  const textareaRef = useRef(null);
+  const pdfCanvasRef = useRef(null);
+  const [copiedIdx, setCopiedIdx] = useState(null);
+  const [pdfViewerState, setPdfViewerState] = useState(null);
+  const [comparisonMode, setComparisonMode] = useState(false);
+  const [comparisonCategories, setComparisonCategories] = useState([null, null]);
+  const [pinnedAnswers, setPinnedAnswers] = useState([]);
+  const [showPinnedPanel, setShowPinnedPanel] = useState(false);
 
   // Initialize Google Drive
   useEffect(() => {
@@ -281,6 +297,24 @@ export default function App() {
     }
   }, [chunks]);
 
+  // Render PDF page to canvas when viewer state changes
+  useEffect(() => {
+    if (!pdfViewerState?.pdfDoc || !pdfCanvasRef.current) return;
+    const renderPage = async () => {
+      const page = await pdfViewerState.pdfDoc.getPage(pdfViewerState.currentPage);
+      const canvas = pdfCanvasRef.current;
+      const ctx = canvas.getContext('2d');
+      const containerWidth = canvas.parentElement?.clientWidth || 600;
+      const unscaledViewport = page.getViewport({ scale: 1 });
+      const scale = containerWidth / unscaledViewport.width;
+      const viewport = page.getViewport({ scale });
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      await page.render({ canvasContext: ctx, viewport }).promise;
+    };
+    renderPage();
+  }, [pdfViewerState?.pdfDoc, pdfViewerState?.currentPage]);
+
   const loadDataFromDrive = async () => {
     setIsLoading(true);
     try {
@@ -299,6 +333,11 @@ export default function App() {
       const historyData = await driveService.readJsonFile(CHAT_HISTORY_FILE_NAME);
       if (historyData) {
         setChatHistory(historyData);
+      }
+
+      const pinnedData = await driveService.readJsonFile(PINNED_ANSWERS_FILE_NAME);
+      if (pinnedData) {
+        setPinnedAnswers(pinnedData);
       }
     } catch (error) {
       console.error('Error loading from Drive:', error);
@@ -338,6 +377,14 @@ export default function App() {
     }
   }, []);
 
+  const savePinnedAnswersToDrive = useCallback(async (pins) => {
+    try {
+      await driveService.writeJsonFile(PINNED_ANSWERS_FILE_NAME, pins);
+    } catch (error) {
+      console.error('Error saving pinned answers:', error);
+    }
+  }, []);
+
   const debouncedSaveChatHistory = useCallback((history) => {
     if (chatHistorySaveTimer.current) {
       clearTimeout(chatHistorySaveTimer.current);
@@ -349,7 +396,7 @@ export default function App() {
 
   // Auto-save messages to chat history when messages change
   useEffect(() => {
-    if (selectedCategory && messages.length > 0 && !isSending) {
+    if (selectedCategory && messages.length > 0 && !isSending && !comparisonMode) {
       const lightweight = messages.map(m => ({ role: m.role, content: m.content }));
       setChatHistory(prev => {
         const updated = {
@@ -360,7 +407,7 @@ export default function App() {
         return updated;
       });
     }
-  }, [messages, isSending, selectedCategory, debouncedSaveChatHistory]);
+  }, [messages, isSending, selectedCategory, debouncedSaveChatHistory, comparisonMode]);
 
   const handleSignIn = () => {
     driveService.signIn();
@@ -374,6 +421,7 @@ export default function App() {
     setChunks([]);
     setMessages([]);
     setChatHistory({});
+    setPinnedAnswers([]);
   };
 
   const saveClientId = () => {
@@ -532,21 +580,46 @@ export default function App() {
     await saveChunksToDrive(newChunks);
   };
 
-  const sendMessage = async () => {
-    if (!input.trim() || isSending || !selectedCategory || !apiKey) return;
+  const sendMessage = async (overrideText) => {
+    const text = (typeof overrideText === 'string' ? overrideText : input).trim();
+    if (!text || isSending || !apiKey) return;
 
-    const userMessage = { role: 'user', content: input.trim() };
+    // In comparison mode, need both categories selected
+    if (comparisonMode) {
+      if (!comparisonCategories[0] || !comparisonCategories[1]) return;
+    } else {
+      if (!selectedCategory) return;
+    }
+
+    const userMessage = { role: 'user', content: text };
     const newMessages = [...messages, userMessage];
     setMessages(newMessages);
     setInput('');
+    if (textareaRef.current) {
+      textareaRef.current.style.height = '48px';
+    }
     setIsSending(true);
 
     try {
-      // Determine which chunks to search based on category selection
-      const isAllCategories = selectedCategory === '__all__';
-      const categoryChunks = isAllCategories
-        ? chunks
-        : chunks.filter(c => c.categoryId === selectedCategory);
+      let categoryChunks;
+      let isAllCategories;
+      let categoryName;
+
+      if (comparisonMode) {
+        categoryChunks = chunks.filter(c => comparisonCategories.includes(c.categoryId));
+        isAllCategories = false;
+        const cat1Name = categories.find(c => c.id === comparisonCategories[0])?.name || 'Unknown';
+        const cat2Name = categories.find(c => c.id === comparisonCategories[1])?.name || 'Unknown';
+        categoryName = `${cat1Name} vs ${cat2Name}`;
+      } else {
+        isAllCategories = selectedCategory === '__all__';
+        categoryChunks = isAllCategories
+          ? chunks
+          : chunks.filter(c => c.categoryId === selectedCategory);
+        categoryName = isAllCategories
+          ? `all categories (${categories.map(c => c.name).join(', ')})`
+          : (categories.find(c => c.id === selectedCategory)?.name || 'Unknown');
+      }
 
       if (categoryChunks.length === 0) {
         setMessages([...newMessages, {
@@ -564,7 +637,7 @@ export default function App() {
       const relevantChunks = await searchChunks({
         bm25Index: categoryIndex,
         chunks: categoryChunks,
-        query: input.trim(),
+        query: text,
         topK: 8,
         smartSearch,
         apiKey,
@@ -572,18 +645,33 @@ export default function App() {
 
       const context = relevantChunks.map((chunk) => {
         const doc = documents.find(d => d.id === chunk.documentId);
-        const catName = isAllCategories
+        const catName = (isAllCategories || comparisonMode)
           ? categories.find(c => c.id === chunk.categoryId)?.name
           : null;
         const sourceLabel = catName ? `${catName} - ${doc?.name || 'Unknown'}` : (doc?.name || 'Unknown');
         return `[Source: ${sourceLabel}]\n${chunk.text}`;
       }).join('\n\n---\n\n');
 
-      const categoryName = isAllCategories
-        ? `all categories (${categories.map(c => c.name).join(', ')})`
-        : (categories.find(c => c.id === selectedCategory)?.name || 'Unknown');
+      let systemPrompt;
+      if (comparisonMode) {
+        const cat1Name = categories.find(c => c.id === comparisonCategories[0])?.name || 'Unknown';
+        const cat2Name = categories.find(c => c.id === comparisonCategories[1])?.name || 'Unknown';
+        systemPrompt = `You are an expert baseball rules advisor comparing rules between ${cat1Name} and ${cat2Name}.
 
-      const systemPrompt = `You are an expert baseball rules advisor specializing in ${categoryName} rules.
+You have access to the following reference material from both rule sets:
+
+${context}
+
+Guidelines:
+1. Compare and contrast the rules between ${cat1Name} and ${cat2Name}
+2. Clearly indicate which rule set each point comes from
+3. Highlight key differences and similarities
+4. Cite specific rules when possible (e.g., "Rule 8-4-2b")
+5. If one rule set covers something the other doesn't, note that
+6. Format responses with clear headers for each rule set
+7. Be conversational but precise`;
+      } else {
+        systemPrompt = `You are an expert baseball rules advisor specializing in ${categoryName} rules.
 
 You have access to the following reference material from the user's uploaded rule books:
 
@@ -597,14 +685,15 @@ Guidelines:
 5. Use examples to illustrate complex situations
 6. Format responses clearly with headers and bullets for complex answers
 7. Explain the reasoning/purpose behind rules when helpful`;
+      }
 
-      // Build rich source details (Feature 3)
+      // Build rich source details
       const sourceDetails = [];
       const seenSourceKeys = new Set();
       for (const c of relevantChunks) {
         const doc = documents.find(d => d.id === c.documentId);
         const docName = doc?.name || 'Unknown';
-        const catName = isAllCategories ? categories.find(cat => cat.id === c.categoryId)?.name : null;
+        const catName = (isAllCategories || comparisonMode) ? categories.find(cat => cat.id === c.categoryId)?.name : null;
         const dedupeKey = `${c.ruleRef || ''}_${c.pageNumber || ''}_${docName}`;
         if (!seenSourceKeys.has(dedupeKey)) {
           seenSourceKeys.add(dedupeKey);
@@ -613,7 +702,9 @@ Guidelines:
             categoryName: catName,
             ruleRef: c.ruleRef,
             pageNumber: c.pageNumber,
-            score: c.score
+            score: c.score,
+            documentId: c.documentId,
+            driveFileId: doc?.driveFileId
           });
         }
       }
@@ -832,6 +923,84 @@ Guidelines:
         return updated;
       });
     }
+  };
+
+  const exportChat = () => {
+    const catName = comparisonMode
+      ? `${categories.find(c => c.id === comparisonCategories[0])?.name || 'Unknown'} vs ${categories.find(c => c.id === comparisonCategories[1])?.name || 'Unknown'}`
+      : selectedCategory === '__all__'
+        ? 'All Categories'
+        : (categories.find(c => c.id === selectedCategory)?.name || 'Unknown');
+    const header = `Baseball Rules Assistant - ${catName}\nExported: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
+    const body = messages.map(m => {
+      let text = `[${m.role === 'user' ? 'You' : 'Assistant'}]\n${m.content}`;
+      if (m.sources && m.sources.length > 0) {
+        const srcLabels = m.sources.map(src => {
+          const prefix = src.categoryName ? `[${src.categoryName}] ` : '';
+          if (src.ruleRef && src.pageNumber) return `${prefix}${src.ruleRef} (p.${src.pageNumber})`;
+          if (src.pageNumber) return `${prefix}${src.docName} p.${src.pageNumber}`;
+          if (src.ruleRef) return `${prefix}${src.ruleRef}`;
+          return `${prefix}${src.docName}`;
+        });
+        text += `\nSources: ${srcLabels.join(', ')}`;
+      }
+      return text;
+    }).join('\n\n---\n\n');
+    const blob = new Blob([header + body], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `rules-chat-${catName.replace(/\s+/g, '-').toLowerCase()}-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const openPdfPage = async (documentId, pageNumber) => {
+    const doc = documents.find(d => d.id === documentId);
+    if (!doc?.driveFileId) return;
+    setPdfViewerState({ docName: doc.name, pageNumber, loading: true, pdfDoc: null, currentPage: pageNumber, totalPages: 0 });
+    try {
+      const arrayBuffer = await driveService.downloadPdf(doc.driveFileId);
+      const pdfDoc = await pdfjsLib.getDocument(new Uint8Array(arrayBuffer)).promise;
+      setPdfViewerState(prev => prev ? { ...prev, pdfDoc, totalPages: pdfDoc.numPages, loading: false } : null);
+    } catch (err) {
+      console.error('Error opening PDF:', err);
+      setPdfViewerState(null);
+    }
+  };
+
+  const pinAnswer = (messageIdx) => {
+    const msg = messages[messageIdx];
+    if (!msg || msg.role !== 'assistant') return;
+    const userMsg = messages[messageIdx - 1];
+    const catName = comparisonMode
+      ? `${categories.find(c => c.id === comparisonCategories[0])?.name} vs ${categories.find(c => c.id === comparisonCategories[1])?.name}`
+      : selectedCategory === '__all__'
+        ? 'All Categories'
+        : (categories.find(c => c.id === selectedCategory)?.name || 'Unknown');
+    const pin = {
+      id: Date.now().toString(),
+      question: userMsg?.content || '',
+      answer: msg.content,
+      sources: msg.sources || [],
+      categoryName: catName,
+      categoryId: selectedCategory,
+      timestamp: new Date().toISOString()
+    };
+    const updated = [pin, ...pinnedAnswers];
+    setPinnedAnswers(updated);
+    savePinnedAnswersToDrive(updated);
+  };
+
+  const unpinAnswer = (pinId) => {
+    const updated = pinnedAnswers.filter(p => p.id !== pinId);
+    setPinnedAnswers(updated);
+    savePinnedAnswersToDrive(updated);
+  };
+
+  const isAnswerPinned = (messageIdx) => {
+    const msg = messages[messageIdx];
+    if (!msg || msg.role !== 'assistant') return false;
+    return pinnedAnswers.some(p => p.answer === msg.content && (p.categoryId === selectedCategory || comparisonMode));
   };
 
   const getCategoryDocs = (categoryId) => documents.filter(d => d.categoryId === categoryId);
@@ -1256,64 +1425,174 @@ Guidelines:
           <div className="h-full flex flex-col">
             {/* Category Selector */}
             <div className="bg-white border-b px-6 py-3">
-              <div className="max-w-4xl mx-auto flex items-center gap-4">
-                <label className="font-medium text-gray-700">Rule Set:</label>
-                <select
-                  value={selectedCategory || ''}
-                  onChange={(e) => {
-                    const newCat = e.target.value || null;
-                    // Save current messages to history before switching
-                    if (selectedCategory && messages.length > 0) {
-                      const lightweight = messages.map(m => ({ role: m.role, content: m.content }));
-                      setChatHistory(prev => {
-                        const updated = {
-                          ...prev,
-                          [selectedCategory]: { messages: lightweight, updatedAt: new Date().toISOString() }
-                        };
-                        debouncedSaveChatHistory(updated);
-                        return updated;
-                      });
-                    }
-                    setSelectedCategory(newCat);
-                    setExpandedChunks(new Set());
-                    // Restore history for new category
-                    if (newCat && chatHistory[newCat]?.messages) {
-                      setMessages(chatHistory[newCat].messages);
-                    } else {
-                      setMessages([]);
-                    }
-                  }}
-                  className="border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500 min-w-48"
-                >
-                  <option value="">Select a category...</option>
-                  {categories.length >= 2 && (
-                    <option value="__all__">All Categories</option>
-                  )}
-                  {categories.map(cat => (
-                    <option key={cat.id} value={cat.id}>
-                      {cat.name} ({getCategoryDocs(cat.id).length} docs)
-                    </option>
-                  ))}
-                </select>
-                {selectedCategory && messages.length > 0 && (
+              <div className="max-w-4xl mx-auto flex flex-wrap items-center gap-4">
+                {!comparisonMode ? (
+                  <>
+                    <label className="font-medium text-gray-700">Rule Set:</label>
+                    <select
+                      value={selectedCategory || ''}
+                      onChange={(e) => {
+                        const newCat = e.target.value || null;
+                        if (selectedCategory && messages.length > 0) {
+                          const lightweight = messages.map(m => ({ role: m.role, content: m.content }));
+                          setChatHistory(prev => {
+                            const updated = {
+                              ...prev,
+                              [selectedCategory]: { messages: lightweight, updatedAt: new Date().toISOString() }
+                            };
+                            debouncedSaveChatHistory(updated);
+                            return updated;
+                          });
+                        }
+                        setSelectedCategory(newCat);
+                        setExpandedChunks(new Set());
+                        if (newCat && chatHistory[newCat]?.messages) {
+                          setMessages(chatHistory[newCat].messages);
+                        } else {
+                          setMessages([]);
+                        }
+                      }}
+                      className="border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500 min-w-48"
+                    >
+                      <option value="">Select a category...</option>
+                      {categories.length >= 2 && (
+                        <option value="__all__">All Categories</option>
+                      )}
+                      {categories.map(cat => (
+                        <option key={cat.id} value={cat.id}>
+                          {cat.name} ({getCategoryDocs(cat.id).length} docs)
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                ) : (
+                  <>
+                    <label className="font-medium text-gray-700">Compare:</label>
+                    <select
+                      value={comparisonCategories[0] || ''}
+                      onChange={(e) => {
+                        setComparisonCategories(prev => [e.target.value || null, prev[1]]);
+                        setMessages([]);
+                      }}
+                      className="border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500"
+                    >
+                      <option value="">Select...</option>
+                      {categories.map(cat => (
+                        <option key={cat.id} value={cat.id} disabled={cat.id === comparisonCategories[1]}>
+                          {cat.name}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="font-bold text-gray-500">vs</span>
+                    <select
+                      value={comparisonCategories[1] || ''}
+                      onChange={(e) => {
+                        setComparisonCategories(prev => [prev[0], e.target.value || null]);
+                        setMessages([]);
+                      }}
+                      className="border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500"
+                    >
+                      <option value="">Select...</option>
+                      {categories.map(cat => (
+                        <option key={cat.id} value={cat.id} disabled={cat.id === comparisonCategories[0]}>
+                          {cat.name}
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                )}
+                {categories.length >= 2 && (
                   <button
-                    onClick={clearChat}
-                    className="text-gray-500 hover:text-gray-700 text-sm font-medium"
+                    onClick={() => {
+                      setComparisonMode(!comparisonMode);
+                      setMessages([]);
+                      if (!comparisonMode) {
+                        setSelectedCategory(null);
+                      } else {
+                        setComparisonCategories([null, null]);
+                      }
+                    }}
+                    className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                      comparisonMode
+                        ? 'bg-purple-100 text-purple-700 border border-purple-300'
+                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200 border border-gray-300'
+                    }`}
                   >
-                    Clear Chat
+                    {comparisonMode ? 'Exit Compare' : 'Compare'}
                   </button>
                 )}
+                <div className="flex items-center gap-2">
+                  {pinnedAnswers.length > 0 && (
+                    <button
+                      onClick={() => setShowPinnedPanel(!showPinnedPanel)}
+                      className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                        showPinnedPanel
+                          ? 'bg-amber-100 text-amber-700 border border-amber-300'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200 border border-gray-300'
+                      }`}
+                    >
+                      Pins ({pinnedAnswers.length})
+                    </button>
+                  )}
+                  {((selectedCategory && messages.length > 0) || (comparisonMode && messages.length > 0)) && (
+                    <>
+                      <button
+                        onClick={exportChat}
+                        className="text-gray-500 hover:text-gray-700 text-sm font-medium"
+                      >
+                        Export
+                      </button>
+                      <button
+                        onClick={clearChat}
+                        className="text-gray-500 hover:text-gray-700 text-sm font-medium"
+                      >
+                        Clear Chat
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
+
+            {/* Pinned Answers Panel */}
+            {showPinnedPanel && pinnedAnswers.length > 0 && (
+              <div className="bg-amber-50 border-b border-amber-200 px-6 py-3 max-h-64 overflow-y-auto">
+                <div className="max-w-4xl mx-auto space-y-2">
+                  {pinnedAnswers.map(pin => (
+                    <div key={pin.id} className="bg-white rounded-lg border border-amber-200 p-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">{pin.categoryName}</span>
+                            <span className="text-xs text-gray-400">{new Date(pin.timestamp).toLocaleDateString()}</span>
+                          </div>
+                          <p className="text-sm font-medium text-gray-800 truncate">{pin.question}</p>
+                          <div className="text-xs text-gray-600 mt-1 line-clamp-2">
+                            <Markdown content={pin.answer.slice(0, 200) + (pin.answer.length > 200 ? '...' : '')} />
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => unpinAnswer(pin.id)}
+                          className="text-amber-500 hover:text-amber-700 text-sm flex-shrink-0"
+                          title="Unpin"
+                        >
+                          Unpin
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto p-6">
               <div className="max-w-4xl mx-auto space-y-4">
-                {!selectedCategory ? (
+                {(comparisonMode ? (!comparisonCategories[0] || !comparisonCategories[1]) : !selectedCategory) ? (
                   <div className="text-center py-12 text-gray-500">
                     <p className="text-4xl mb-4">👆</p>
-                    <p className="text-lg">Select a rule set category above to start asking questions</p>
-                    {categories.length === 0 && (
+                    <p className="text-lg">{comparisonMode ? 'Select two categories above to compare rules' : 'Select a rule set category above to start asking questions'}</p>
+                    {categories.length === 0 && !comparisonMode && (
                       <p className="mt-2">Go to "Manage Documents" tab to create categories and upload PDFs first</p>
                     )}
                   </div>
@@ -1321,9 +1600,25 @@ Guidelines:
                   <div className="text-center py-12 text-gray-500">
                     <p className="text-4xl mb-4">⚾</p>
                     <p className="text-lg">
-                      Ready to answer questions about {selectedCategory === '__all__' ? 'all categories' : categories.find(c => c.id === selectedCategory)?.name} rules!
+                      Ready to answer questions about {
+                        comparisonMode
+                          ? `${categories.find(c => c.id === comparisonCategories[0])?.name || '...'} vs ${categories.find(c => c.id === comparisonCategories[1])?.name || '...'}`
+                          : selectedCategory === '__all__' ? 'all categories' : categories.find(c => c.id === selectedCategory)?.name
+                      } rules!
                     </p>
-                    <p className="mt-2">Ask me anything about the rules in your uploaded documents.</p>
+                    <p className="mt-2 mb-4">Try one of these questions, or ask your own:</p>
+                    <div className="flex flex-wrap justify-center gap-2">
+                      {STARTER_QUESTIONS.map((q, qi) => (
+                        <button
+                          key={qi}
+                          onClick={() => sendMessage(q)}
+                          disabled={isSending || !apiKey}
+                          className="bg-white border border-green-300 text-green-800 rounded-full px-4 py-2 text-sm hover:bg-green-50 transition-colors disabled:opacity-50"
+                        >
+                          {q}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 ) : (
                   messages.map((msg, idx) => (
@@ -1336,7 +1631,31 @@ Guidelines:
                         {msg.role === 'user' ? (
                           <div className="whitespace-pre-wrap">{msg.content}</div>
                         ) : (
-                          <Markdown content={msg.content} />
+                          <>
+                            <Markdown content={msg.content} />
+                            {msg.content && (
+                              <div className="flex items-center gap-2 mt-2 -mb-1">
+                                <button
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(msg.content);
+                                    setCopiedIdx(idx);
+                                    setTimeout(() => setCopiedIdx(null), 2000);
+                                  }}
+                                  className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                                >
+                                  {copiedIdx === idx ? 'Copied!' : 'Copy'}
+                                </button>
+                                <button
+                                  onClick={() => isAnswerPinned(idx) ? unpinAnswer(pinnedAnswers.find(p => p.answer === msg.content)?.id) : pinAnswer(idx)}
+                                  className={`text-xs transition-colors ${
+                                    isAnswerPinned(idx) ? 'text-amber-500 hover:text-amber-700' : 'text-gray-400 hover:text-gray-600'
+                                  }`}
+                                >
+                                  {isAnswerPinned(idx) ? 'Pinned' : 'Pin'}
+                                </button>
+                              </div>
+                            )}
+                          </>
                         )}
                         {/* Source Citations (Feature 3) */}
                         {msg.sources && msg.sources.length > 0 && (
@@ -1357,7 +1676,16 @@ Guidelines:
                                 } else {
                                   label = `${prefix}${src.docName}`;
                                 }
-                                return (
+                                const clickable = src.documentId && src.pageNumber && src.driveFileId;
+                                return clickable ? (
+                                  <button
+                                    key={si}
+                                    onClick={() => openPdfPage(src.documentId, src.pageNumber)}
+                                    className="inline-block bg-green-50 text-green-800 text-xs px-2 py-1 rounded-full border border-green-200 hover:bg-green-100 transition-colors cursor-pointer"
+                                  >
+                                    📚 {label}
+                                  </button>
+                                ) : (
                                   <span
                                     key={si}
                                     className="inline-block bg-green-50 text-green-800 text-xs px-2 py-1 rounded-full border border-green-200"
@@ -1440,24 +1768,35 @@ Guidelines:
             {/* Input */}
             <div className="border-t bg-white p-4">
               <div className="max-w-4xl mx-auto flex gap-3">
-                <input
-                  type="text"
+                <textarea
+                  ref={textareaRef}
+                  rows={1}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
+                  onInput={(e) => {
+                    e.target.style.height = '48px';
+                    e.target.style.height = Math.min(e.target.scrollHeight, 150) + 'px';
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      sendMessage();
+                    }
+                  }}
                   placeholder={
-                    !apiKey 
-                      ? "Add your API key in Settings first..." 
-                      : !selectedCategory 
-                        ? "Select a category first..." 
-                        : "Ask a rules question..."
+                    !apiKey
+                      ? "Add your API key in Settings first..."
+                      : (!selectedCategory && !comparisonMode)
+                        ? "Select a category first..."
+                        : "Ask a rules question... (Shift+Enter for new line)"
                   }
-                  disabled={!selectedCategory || isSending || !apiKey}
-                  className="flex-1 border border-gray-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-100"
+                  disabled={comparisonMode ? (!comparisonCategories[0] || !comparisonCategories[1] || isSending || !apiKey) : (!selectedCategory || isSending || !apiKey)}
+                  className="flex-1 border border-gray-300 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-green-500 disabled:bg-gray-100 resize-none overflow-hidden"
+                  style={{ minHeight: '48px', maxHeight: '150px' }}
                 />
                 <button
-                  onClick={sendMessage}
-                  disabled={!selectedCategory || isSending || !input.trim() || !apiKey}
+                  onClick={() => sendMessage()}
+                  disabled={comparisonMode ? (!comparisonCategories[0] || !comparisonCategories[1] || isSending || !input.trim() || !apiKey) : (!selectedCategory || isSending || !input.trim() || !apiKey)}
                   className="bg-green-600 hover:bg-green-700 disabled:bg-gray-300 text-white px-6 py-3 rounded-xl font-medium transition-colors"
                 >
                   Send
@@ -1467,6 +1806,58 @@ Guidelines:
           </div>
         )}
       </div>
+
+      {/* PDF Viewer Modal */}
+      {pdfViewerState && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full mx-4 max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between px-6 py-4 border-b">
+              <div>
+                <h3 className="font-semibold">{pdfViewerState.docName}</h3>
+                {pdfViewerState.totalPages > 0 && (
+                  <p className="text-sm text-gray-500">Page {pdfViewerState.currentPage} of {pdfViewerState.totalPages}</p>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {pdfViewerState.totalPages > 0 && (
+                  <>
+                    <button
+                      onClick={() => setPdfViewerState(prev => prev && prev.currentPage > 1 ? { ...prev, currentPage: prev.currentPage - 1 } : prev)}
+                      disabled={!pdfViewerState.pdfDoc || pdfViewerState.currentPage <= 1}
+                      className="px-3 py-1 rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-sm"
+                    >
+                      Prev
+                    </button>
+                    <button
+                      onClick={() => setPdfViewerState(prev => prev && prev.currentPage < prev.totalPages ? { ...prev, currentPage: prev.currentPage + 1 } : prev)}
+                      disabled={!pdfViewerState.pdfDoc || pdfViewerState.currentPage >= pdfViewerState.totalPages}
+                      className="px-3 py-1 rounded bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-sm"
+                    >
+                      Next
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => setPdfViewerState(null)}
+                  className="ml-2 text-gray-500 hover:text-gray-700 text-xl font-bold"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-auto p-4">
+              {pdfViewerState.loading ? (
+                <div className="text-center py-12">
+                  <div className="animate-spin text-4xl mb-4">⚾</div>
+                  <p className="text-gray-500">Loading PDF...</p>
+                </div>
+              ) : (
+                <canvas ref={pdfCanvasRef} className="mx-auto" />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
