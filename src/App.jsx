@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
+import { searchChunks, BM25Index } from './search/index.js';
+import { chunkText } from './chunking/index.js';
 
 // Set up PDF.js worker for v5+
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -210,66 +212,8 @@ class GoogleDriveService {
 const driveService = new GoogleDriveService();
 
 // ============ Text Processing ============
-const chunkText = (text, chunkSize = 1500, overlap = 200) => {
-  const chunks = [];
-  let start = 0;
-  while (start < text.length) {
-    const end = Math.min(start + chunkSize, text.length);
-    chunks.push(text.slice(start, end));
-    start = end - overlap;
-    if (start + overlap >= text.length) break;
-  }
-  return chunks;
-};
-
-const extractKeywords = (text) => {
-  const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 
-    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
-    'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of', 'in', 'for', 'on', 'with',
-    'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below',
-    'between', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where',
-    'why', 'how', 'all', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor',
-    'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or',
-    'because', 'until', 'while', 'this', 'that', 'these', 'those', 'what', 'which', 'who']);
-  
-  return text.toLowerCase()
-    .replace(/[^\w\s-]/g, ' ')
-    .split(/\s+/)
-    .filter(word => word.length > 2 && !stopWords.has(word));
-};
-
-const searchChunks = (chunks, query, topK = 8) => {
-  const queryKeywords = new Set(extractKeywords(query));
-  
-  const scored = chunks.map(chunk => {
-    const chunkKeywords = extractKeywords(chunk.text);
-    let score = 0;
-    
-    chunkKeywords.forEach(word => {
-      if (queryKeywords.has(word)) score += 1;
-    });
-    
-    const rulePattern = /rule\s*\d+[-.]?\d*/gi;
-    const queryRules = query.match(rulePattern) || [];
-    const chunkRules = chunk.text.match(rulePattern) || [];
-    queryRules.forEach(rule => {
-      if (chunkRules.some(cr => cr.toLowerCase().includes(rule.toLowerCase()))) {
-        score += 5;
-      }
-    });
-    
-    if (chunk.text.toLowerCase().includes(query.toLowerCase())) {
-      score += 10;
-    }
-    
-    return { ...chunk, score };
-  });
-  
-  return scored
-    .filter(c => c.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
-};
+// chunkText imported from ./chunking/index.js
+// searchChunks, BM25Index imported from ./search/index.js
 
 // ============ Main Component ============
 export default function App() {
@@ -297,7 +241,10 @@ export default function App() {
   const [newCategoryName, setNewCategoryName] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [saveStatus, setSaveStatus] = useState('');
+  const [smartSearch, setSmartSearch] = useState(() => localStorage.getItem('smartSearch') !== 'false');
+  const [isReindexing, setIsReindexing] = useState(false);
   const messagesEndRef = useRef(null);
+  const bm25IndexRef = useRef(new BM25Index());
 
   // Initialize Google Drive
   useEffect(() => {
@@ -319,6 +266,14 @@ export default function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Rebuild BM25 index when chunks change
+  useEffect(() => {
+    if (chunks.length > 0) {
+      bm25IndexRef.current.build(chunks);
+      console.log(`BM25 index built with ${chunks.length} chunks`);
+    }
+  }, [chunks]);
 
   const loadDataFromDrive = async () => {
     setIsLoading(true);
@@ -480,15 +435,22 @@ export default function App() {
       };
       
       setUploadProgress('Processing text chunks...');
-      const textChunks = chunkText(text, 1500, 200);
-      
-      const newChunks = textChunks.map((chunkText, i) => ({
+      const textChunks = chunkText(text);
+
+      const newChunks = textChunks.map((chunk, i) => ({
         id: `${document.id}_${i}`,
         documentId: document.id,
         categoryId,
-        text: chunkText,
+        text: chunk.text,
+        ruleRef: chunk.ruleRef,
+        sectionType: chunk.sectionType,
+        pageNumber: chunk.pageNumber,
         index: i
       }));
+
+      console.log(`Created ${newChunks.length} rule-aware chunks`,
+        newChunks.filter(c => c.ruleRef).length, 'with rule refs',
+        newChunks.filter(c => c.sectionType !== 'rule').length, 'with special section types');
       
       const updatedDocuments = [...documents, document];
       const updatedChunks = [...chunks, ...newChunks];
@@ -537,7 +499,7 @@ export default function App() {
     
     try {
       const categoryChunks = chunks.filter(c => c.categoryId === selectedCategory);
-      
+
       if (categoryChunks.length === 0) {
         setMessages([...newMessages, {
           role: 'assistant',
@@ -546,8 +508,19 @@ export default function App() {
         setIsSending(false);
         return;
       }
-      
-      const relevantChunks = searchChunks(categoryChunks, input.trim(), 8);
+
+      // Build a category-specific BM25 index
+      const categoryIndex = new BM25Index();
+      categoryIndex.build(categoryChunks);
+
+      const relevantChunks = await searchChunks({
+        bm25Index: categoryIndex,
+        chunks: categoryChunks,
+        query: input.trim(),
+        topK: 8,
+        smartSearch,
+        apiKey,
+      });
       
       const context = relevantChunks.map((chunk) => {
         const doc = documents.find(d => d.id === chunk.documentId);
@@ -640,6 +613,63 @@ Guidelines:
       }]);
     } finally {
       setIsSending(false);
+    }
+  };
+
+  const reindexDocuments = async () => {
+    if (!confirm('Re-index all documents with improved rule-aware chunking? This will re-download and re-process all PDFs.')) return;
+
+    setIsReindexing(true);
+    setUploadProgress('Re-indexing documents...');
+
+    try {
+      let allNewChunks = [];
+
+      for (let i = 0; i < documents.length; i++) {
+        const doc = documents[i];
+        setUploadProgress(`Re-indexing ${doc.name} (${i + 1}/${documents.length})...`);
+
+        if (!doc.driveFileId) continue;
+
+        try {
+          const arrayBuffer = await driveService.downloadPdf(doc.driveFileId);
+          const { text } = await extractTextFromPDF(arrayBuffer);
+          const textChunks = chunkText(text);
+
+          const docChunks = textChunks.map((chunk, idx) => ({
+            id: `${doc.id}_${idx}`,
+            documentId: doc.id,
+            categoryId: doc.categoryId,
+            text: chunk.text,
+            ruleRef: chunk.ruleRef,
+            sectionType: chunk.sectionType,
+            pageNumber: chunk.pageNumber,
+            index: idx
+          }));
+
+          allNewChunks = [...allNewChunks, ...docChunks];
+        } catch (err) {
+          console.error(`Error re-indexing ${doc.name}:`, err);
+          // Keep old chunks for this doc
+          const oldDocChunks = chunks.filter(c => c.documentId === doc.id);
+          allNewChunks = [...allNewChunks, ...oldDocChunks];
+        }
+      }
+
+      setChunks(allNewChunks);
+      setUploadProgress('Saving re-indexed chunks...');
+      await saveChunksToDrive(allNewChunks);
+
+      console.log(`Re-indexed: ${allNewChunks.length} total chunks`,
+        allNewChunks.filter(c => c.ruleRef).length, 'with rule refs');
+
+      setUploadProgress(null);
+    } catch (error) {
+      console.error('Re-index error:', error);
+      setUploadProgress(`Re-index error: ${error.message}`);
+      setTimeout(() => setUploadProgress(null), 3000);
+    } finally {
+      setIsReindexing(false);
     }
   };
 
@@ -848,6 +878,33 @@ Guidelines:
               </p>
             </div>
 
+            <div className="mb-4">
+              <label className="flex items-center justify-between">
+                <div>
+                  <span className="text-sm font-medium text-gray-700">Smart Search</span>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Uses AI to expand your questions with better search terms. Adds ~1s latency per question.
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    const newVal = !smartSearch;
+                    setSmartSearch(newVal);
+                    localStorage.setItem('smartSearch', String(newVal));
+                  }}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ml-4 flex-shrink-0 ${
+                    smartSearch ? 'bg-green-600' : 'bg-gray-300'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      smartSearch ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </label>
+            </div>
+
             <div className="flex justify-end">
               <button
                 onClick={() => setShowSettings(false)}
@@ -930,6 +987,27 @@ Guidelines:
                   </button>
                 </div>
               </div>
+
+              {/* Re-index Button */}
+              {documents.length > 0 && (
+                <div className="bg-white rounded-xl shadow-sm p-6">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h2 className="text-lg font-semibold">Re-index Documents</h2>
+                      <p className="text-sm text-gray-500 mt-1">
+                        Re-process all PDFs with improved rule-aware chunking for better search quality.
+                      </p>
+                    </div>
+                    <button
+                      onClick={reindexDocuments}
+                      disabled={isReindexing}
+                      className="bg-amber-600 hover:bg-amber-700 disabled:bg-gray-300 text-white px-6 py-2 rounded-lg font-medium transition-colors flex-shrink-0"
+                    >
+                      {isReindexing ? 'Re-indexing...' : 'Re-index All'}
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Categories List */}
               {categories.length === 0 ? (
