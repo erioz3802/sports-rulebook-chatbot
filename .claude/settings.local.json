@@ -3,7 +3,8 @@
     "allow": [
       "Bash(cd \"C:/Users/c65917/OneDrive - Microchip Technology Inc/Documents/Personal/JES Baseball/sports-rulebook-chatbot\" && npm run build 2>&1)",
       "Bash(cd \"C:/Users/c65917/OneDrive - Microchip Technology Inc/Documents/Personal/JES Baseball/sports-rulebook-chatbot\" && npx vite build 2>&1)",
-      "Bash(cd \"C:/Users/c65917/OneDrive - Microchip Technology Inc/Documents/Personal/JES Baseball/sports-rulebook-chatbot\" && npm install 2>&1 && npx vite build 2>&1)"
+      "Bash(cd \"C:/Users/c65917/OneDrive - Microchip Technology Inc/Documents/Personal/JES Baseball/sports-rulebook-chatbot\" && npm install 2>&1 && npx vite build 2>&1)",
+      "Bash(cd \"C:\\\\Users\\\\c65917\\\\OneDrive - Microchip Technology Inc\\\\Documents\\\\Personal\\\\JES Baseball\\\\sports-rulebook-chatbot\" && npm run build 2>&1)"
     ]
   },
   "enableAllProjectMcpServers": true,

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { searchChunks, BM25Index } from './search/index.js';
 import { chunkText } from './chunking/index.js';
+import Markdown from './components/Markdown.jsx';
 
 // Set up PDF.js worker for v5+
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
@@ -14,6 +15,7 @@ const SCOPES = 'https://www.googleapis.com/auth/drive.file';
 const APP_FOLDER_NAME = 'BaseballRulesAssistant';
 const CONFIG_FILE_NAME = 'config.json';
 const CHUNKS_FILE_NAME = 'chunks.json';
+const CHAT_HISTORY_FILE_NAME = 'chat-history.json';
 
 class GoogleDriveService {
   constructor() {
@@ -243,6 +245,10 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState('');
   const [smartSearch, setSmartSearch] = useState(() => localStorage.getItem('smartSearch') !== 'false');
   const [isReindexing, setIsReindexing] = useState(false);
+  const [expandedChunks, setExpandedChunks] = useState(new Set());
+  const [chatHistory, setChatHistory] = useState({});
+  const chatHistorySaveTimer = useRef(null);
+  const previousCategoryRef = useRef(null);
   const messagesEndRef = useRef(null);
   const bm25IndexRef = useRef(new BM25Index());
 
@@ -289,6 +295,11 @@ export default function App() {
       if (chunksData) {
         setChunks(chunksData);
       }
+
+      const historyData = await driveService.readJsonFile(CHAT_HISTORY_FILE_NAME);
+      if (historyData) {
+        setChatHistory(historyData);
+      }
     } catch (error) {
       console.error('Error loading from Drive:', error);
     }
@@ -319,6 +330,38 @@ export default function App() {
     }
   }, []);
 
+  const saveChatHistoryToDrive = useCallback(async (history) => {
+    try {
+      await driveService.writeJsonFile(CHAT_HISTORY_FILE_NAME, history);
+    } catch (error) {
+      console.error('Error saving chat history:', error);
+    }
+  }, []);
+
+  const debouncedSaveChatHistory = useCallback((history) => {
+    if (chatHistorySaveTimer.current) {
+      clearTimeout(chatHistorySaveTimer.current);
+    }
+    chatHistorySaveTimer.current = setTimeout(() => {
+      saveChatHistoryToDrive(history);
+    }, 2000);
+  }, [saveChatHistoryToDrive]);
+
+  // Auto-save messages to chat history when messages change
+  useEffect(() => {
+    if (selectedCategory && messages.length > 0 && !isSending) {
+      const lightweight = messages.map(m => ({ role: m.role, content: m.content }));
+      setChatHistory(prev => {
+        const updated = {
+          ...prev,
+          [selectedCategory]: { messages: lightweight, updatedAt: new Date().toISOString() }
+        };
+        debouncedSaveChatHistory(updated);
+        return updated;
+      });
+    }
+  }, [messages, isSending, selectedCategory, debouncedSaveChatHistory]);
+
   const handleSignIn = () => {
     driveService.signIn();
   };
@@ -330,6 +373,7 @@ export default function App() {
     setDocuments([]);
     setChunks([]);
     setMessages([]);
+    setChatHistory({});
   };
 
   const saveClientId = () => {
@@ -490,15 +534,19 @@ export default function App() {
 
   const sendMessage = async () => {
     if (!input.trim() || isSending || !selectedCategory || !apiKey) return;
-    
+
     const userMessage = { role: 'user', content: input.trim() };
     const newMessages = [...messages, userMessage];
     setMessages(newMessages);
     setInput('');
     setIsSending(true);
-    
+
     try {
-      const categoryChunks = chunks.filter(c => c.categoryId === selectedCategory);
+      // Determine which chunks to search based on category selection
+      const isAllCategories = selectedCategory === '__all__';
+      const categoryChunks = isAllCategories
+        ? chunks
+        : chunks.filter(c => c.categoryId === selectedCategory);
 
       if (categoryChunks.length === 0) {
         setMessages([...newMessages, {
@@ -521,16 +569,22 @@ export default function App() {
         smartSearch,
         apiKey,
       });
-      
+
       const context = relevantChunks.map((chunk) => {
         const doc = documents.find(d => d.id === chunk.documentId);
-        return `[Source: ${doc?.name || 'Unknown'}]\n${chunk.text}`;
+        const catName = isAllCategories
+          ? categories.find(c => c.id === chunk.categoryId)?.name
+          : null;
+        const sourceLabel = catName ? `${catName} - ${doc?.name || 'Unknown'}` : (doc?.name || 'Unknown');
+        return `[Source: ${sourceLabel}]\n${chunk.text}`;
       }).join('\n\n---\n\n');
-      
-      const categoryName = categories.find(c => c.id === selectedCategory)?.name || 'Unknown';
-      
-      const systemPrompt = `You are an expert baseball rules advisor specializing in ${categoryName} rules. 
-      
+
+      const categoryName = isAllCategories
+        ? `all categories (${categories.map(c => c.name).join(', ')})`
+        : (categories.find(c => c.id === selectedCategory)?.name || 'Unknown');
+
+      const systemPrompt = `You are an expert baseball rules advisor specializing in ${categoryName} rules.
+
 You have access to the following reference material from the user's uploaded rule books:
 
 ${context}
@@ -544,8 +598,47 @@ Guidelines:
 6. Format responses clearly with headers and bullets for complex answers
 7. Explain the reasoning/purpose behind rules when helpful`;
 
+      // Build rich source details (Feature 3)
+      const sourceDetails = [];
+      const seenSourceKeys = new Set();
+      for (const c of relevantChunks) {
+        const doc = documents.find(d => d.id === c.documentId);
+        const docName = doc?.name || 'Unknown';
+        const catName = isAllCategories ? categories.find(cat => cat.id === c.categoryId)?.name : null;
+        const dedupeKey = `${c.ruleRef || ''}_${c.pageNumber || ''}_${docName}`;
+        if (!seenSourceKeys.has(dedupeKey)) {
+          seenSourceKeys.add(dedupeKey);
+          sourceDetails.push({
+            docName,
+            categoryName: catName,
+            ruleRef: c.ruleRef,
+            pageNumber: c.pageNumber,
+            score: c.score
+          });
+        }
+      }
+
+      // Build search results for transparency panel (Feature 4)
+      const searchResults = relevantChunks.map(c => ({
+        text: c.text.slice(0, 300),
+        score: typeof c.score === 'number' ? c.score.toFixed(1) : '0',
+        ruleRef: c.ruleRef,
+        sectionType: c.sectionType,
+        pageNumber: c.pageNumber
+      }));
+
+      // Add placeholder assistant message for streaming
+      const assistantMessage = {
+        role: 'assistant',
+        content: '',
+        sources: sourceDetails,
+        searchResults
+      };
+      setMessages([...newMessages, assistantMessage]);
+
       const maxRetries = 3;
       let lastError = null;
+      let streamStarted = false;
 
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         if (attempt > 0) {
@@ -564,53 +657,109 @@ Guidelines:
           body: JSON.stringify({
             model: selectedModel,
             max_tokens: 2000,
+            stream: true,
             system: systemPrompt,
             messages: newMessages.slice(-10).map(m => ({ role: m.role, content: m.content }))
           })
         });
 
-        const data = await response.json();
-
-        if (data.content?.[0]?.text) {
-          const sourceDocs = [...new Set(relevantChunks.map(c => {
-            const doc = documents.find(d => d.id === c.documentId);
-            return doc?.name;
-          }).filter(Boolean))];
-
-          setMessages([...newMessages, {
-            role: 'assistant',
-            content: data.content[0].text,
-            sources: sourceDocs
-          }]);
-          return;
-        } else if (data.error) {
-          lastError = data.error;
-          // Retry on overload (529) or rate limit (429) errors
+        if (!response.ok) {
           if (response.status === 529 || response.status === 429) {
+            lastError = { message: `API error ${response.status}` };
             continue;
           }
-          throw new Error(data.error.message);
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error?.message || `API error ${response.status}`);
+        }
+
+        // Stream the response
+        streamStarted = true;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let accumulated = '';
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const jsonStr = line.slice(6).trim();
+            if (jsonStr === '[DONE]') continue;
+
+            try {
+              const event = JSON.parse(jsonStr);
+              if (event.type === 'content_block_delta' && event.delta?.text) {
+                accumulated += event.delta.text;
+                const textSoFar = accumulated;
+                setMessages(prev => {
+                  const updated = [...prev];
+                  const last = updated[updated.length - 1];
+                  if (last && last.role === 'assistant') {
+                    updated[updated.length - 1] = { ...last, content: textSoFar };
+                  }
+                  return updated;
+                });
+              }
+            } catch {
+              // Skip malformed JSON
+            }
+          }
+        }
+
+        // Finalize - ensure final content is set
+        if (accumulated) {
+          const finalText = accumulated;
+          const finalSources = sourceDetails;
+          const finalSearchResults = searchResults;
+          setMessages(prev => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last && last.role === 'assistant') {
+              updated[updated.length - 1] = {
+                ...last,
+                content: finalText,
+                sources: finalSources,
+                searchResults: finalSearchResults
+              };
+            }
+            return updated;
+          });
+          return;
         }
       }
 
       // All retries exhausted
-      throw new Error(lastError?.message || 'The API is currently overloaded. Please try again in a moment.');
+      if (!streamStarted) {
+        throw new Error(lastError?.message || 'The API is currently overloaded. Please try again in a moment.');
+      }
     } catch (error) {
       const msg = error.message?.toLowerCase() || '';
-      let userMessage;
+      let errorContent;
       if (msg.includes('overloaded')) {
-        userMessage = 'The AI service is temporarily overloaded. Please wait a moment and try again.';
+        errorContent = 'The AI service is temporarily overloaded. Please wait a moment and try again.';
       } else if (msg.includes('invalid') || msg.includes('authentication') || msg.includes('unauthorized')) {
-        userMessage = 'API key error. Please check your API key in Settings.';
+        errorContent = 'API key error. Please check your API key in Settings.';
       } else if (msg.includes('rate')) {
-        userMessage = 'Rate limit reached. Please wait a moment and try again.';
+        errorContent = 'Rate limit reached. Please wait a moment and try again.';
       } else {
-        userMessage = `Error: ${error.message}`;
+        errorContent = `Error: ${error.message}`;
       }
-      setMessages([...newMessages, {
-        role: 'assistant',
-        content: userMessage
-      }]);
+      setMessages(prev => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        if (last && last.role === 'assistant') {
+          updated[updated.length - 1] = { ...last, content: errorContent };
+        } else {
+          updated.push({ role: 'assistant', content: errorContent });
+        }
+        return updated;
+      });
     } finally {
       setIsSending(false);
     }
@@ -675,6 +824,14 @@ Guidelines:
 
   const clearChat = () => {
     setMessages([]);
+    if (selectedCategory) {
+      setChatHistory(prev => {
+        const updated = { ...prev };
+        delete updated[selectedCategory];
+        debouncedSaveChatHistory(updated);
+        return updated;
+      });
+    }
   };
 
   const getCategoryDocs = (categoryId) => documents.filter(d => d.categoryId === categoryId);
@@ -1104,12 +1261,34 @@ Guidelines:
                 <select
                   value={selectedCategory || ''}
                   onChange={(e) => {
-                    setSelectedCategory(e.target.value || null);
-                    setMessages([]);
+                    const newCat = e.target.value || null;
+                    // Save current messages to history before switching
+                    if (selectedCategory && messages.length > 0) {
+                      const lightweight = messages.map(m => ({ role: m.role, content: m.content }));
+                      setChatHistory(prev => {
+                        const updated = {
+                          ...prev,
+                          [selectedCategory]: { messages: lightweight, updatedAt: new Date().toISOString() }
+                        };
+                        debouncedSaveChatHistory(updated);
+                        return updated;
+                      });
+                    }
+                    setSelectedCategory(newCat);
+                    setExpandedChunks(new Set());
+                    // Restore history for new category
+                    if (newCat && chatHistory[newCat]?.messages) {
+                      setMessages(chatHistory[newCat].messages);
+                    } else {
+                      setMessages([]);
+                    }
                   }}
                   className="border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-green-500 min-w-48"
                 >
                   <option value="">Select a category...</option>
+                  {categories.length >= 2 && (
+                    <option value="__all__">All Categories</option>
+                  )}
                   {categories.map(cat => (
                     <option key={cat.id} value={cat.id}>
                       {cat.name} ({getCategoryDocs(cat.id).length} docs)
@@ -1142,7 +1321,7 @@ Guidelines:
                   <div className="text-center py-12 text-gray-500">
                     <p className="text-4xl mb-4">⚾</p>
                     <p className="text-lg">
-                      Ready to answer questions about {categories.find(c => c.id === selectedCategory)?.name} rules!
+                      Ready to answer questions about {selectedCategory === '__all__' ? 'all categories' : categories.find(c => c.id === selectedCategory)?.name} rules!
                     </p>
                     <p className="mt-2">Ask me anything about the rules in your uploaded documents.</p>
                   </div>
@@ -1154,10 +1333,87 @@ Guidelines:
                           ? 'bg-green-600 text-white rounded-br-md'
                           : 'bg-white shadow-md border border-gray-200 rounded-bl-md'
                       }`}>
-                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                        {msg.role === 'user' ? (
+                          <div className="whitespace-pre-wrap">{msg.content}</div>
+                        ) : (
+                          <Markdown content={msg.content} />
+                        )}
+                        {/* Source Citations (Feature 3) */}
                         {msg.sources && msg.sources.length > 0 && (
-                          <div className="mt-3 pt-3 border-t border-gray-200 text-xs text-gray-500">
-                            📚 Sources: {msg.sources.join(', ')}
+                          <div className="mt-3 pt-3 border-t border-gray-200">
+                            <div className="flex flex-wrap gap-1.5">
+                              {(Array.isArray(msg.sources) && typeof msg.sources[0] === 'object'
+                                ? msg.sources
+                                : msg.sources.map(s => ({ docName: s }))
+                              ).map((src, si) => {
+                                let label;
+                                const prefix = src.categoryName ? `[${src.categoryName}] ` : '';
+                                if (src.ruleRef && src.pageNumber) {
+                                  label = `${prefix}${src.ruleRef} (p.${src.pageNumber})`;
+                                } else if (src.pageNumber) {
+                                  label = `${prefix}${src.docName} p.${src.pageNumber}`;
+                                } else if (src.ruleRef) {
+                                  label = `${prefix}${src.ruleRef}`;
+                                } else {
+                                  label = `${prefix}${src.docName}`;
+                                }
+                                return (
+                                  <span
+                                    key={si}
+                                    className="inline-block bg-green-50 text-green-800 text-xs px-2 py-1 rounded-full border border-green-200"
+                                  >
+                                    📚 {label}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                        {/* Search Transparency Panel (Feature 4) */}
+                        {msg.searchResults && msg.searchResults.length > 0 && (
+                          <div className="mt-2">
+                            <button
+                              onClick={() => setExpandedChunks(prev => {
+                                const next = new Set(prev);
+                                if (next.has(idx)) next.delete(idx);
+                                else next.add(idx);
+                                return next;
+                              })}
+                              className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                            >
+                              {expandedChunks.has(idx) ? '▼ Hide' : '▶ Show'} search results ({msg.searchResults.length})
+                            </button>
+                            {expandedChunks.has(idx) && (
+                              <div className="mt-2 space-y-2">
+                                {[...msg.searchResults]
+                                  .sort((a, b) => parseFloat(b.score) - parseFloat(a.score))
+                                  .map((sr, sri) => (
+                                    <div key={sri} className="bg-gray-50 border border-gray-200 rounded-lg p-3 text-xs">
+                                      <div className="flex items-center gap-2 mb-1">
+                                        <span className="bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-mono font-medium">
+                                          {sr.score}
+                                        </span>
+                                        {sr.ruleRef && (
+                                          <span className="bg-green-100 text-green-700 px-1.5 py-0.5 rounded">
+                                            {sr.ruleRef}
+                                          </span>
+                                        )}
+                                        {sr.sectionType && sr.sectionType !== 'rule' && (
+                                          <span className="bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded">
+                                            {sr.sectionType}
+                                          </span>
+                                        )}
+                                        {sr.pageNumber && (
+                                          <span className="text-gray-500">p.{sr.pageNumber}</span>
+                                        )}
+                                      </div>
+                                      <p className="text-gray-600 leading-snug">
+                                        {sr.text.length > 200 ? sr.text.slice(0, 200) + '...' : sr.text}
+                                      </p>
+                                    </div>
+                                  ))}
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
@@ -1165,7 +1421,7 @@ Guidelines:
                   ))
                 )}
                 
-                {isSending && (
+                {isSending && (messages.length === 0 || messages[messages.length - 1]?.role !== 'assistant' || !messages[messages.length - 1]?.content) && (
                   <div className="flex justify-start">
                     <div className="bg-white shadow-md border border-gray-200 rounded-2xl rounded-bl-md px-5 py-3">
                       <div className="flex items-center gap-1 text-gray-500">
